@@ -106,15 +106,19 @@ no QUIC API at all. It serves `/baseline2` and nothing else.
 - **Failure is not fatal and not silent-in-the-wrong-way.** With no
   `DATABASE_URL`, or a pool that will not open, `/async-db` answers the
   documented `{"items":[],"count":0}` and the other profiles serve normally.
-- **At the profile's own shape — 1024 held connections, closed loop — the pool
-  saturates without failing.** Measured against a Postgres seeded with the
-  profile's 100,000 rows, with `DATABASE_MAX_CONN=256` and the server's
-  `max_connections` the same figure: 92,784 requests over 10 s, **zero** empty
-  and zero with the wrong `count`. That combination is the tight one, because
-  the pool's ceiling and the server's are the same number — the pool filled it
-  and requests then queued for a free connection instead of being rejected. A
-  pool sized *above* `DATABASE_MAX_CONN` would answer `count: 0` under exactly
-  this load, which is the failure the profile's standard rule names.
+- **At the profile's own generator shape the pool saturates without failing.**
+  `scripts/lib/tools/gcannon.sh` drives this endpoint with `-r 25`, so each
+  socket serves 25 requests and is then retired and replaced; 1024 is how many
+  are live at once, not how many exist. Measured in that shape, against a
+  Postgres seeded with the profile's own 100,000 rows, with
+  `DATABASE_MAX_CONN=256` and the server's `max_connections` the same figure:
+  84,807 requests over 10 s across 3,072 socket retirements, **zero** empty
+  bodies and zero with the wrong `count`. That combination is the tight one,
+  because the pool's ceiling and the server's are the same number — the pool
+  filled it and later requests waited for a free connection instead of being
+  rejected. A pool sized *above* `DATABASE_MAX_CONN` would answer `count: 0`
+  under exactly this load, which is the failure the profile's standard rule
+  names.
 
 ### The h3 leg
 
