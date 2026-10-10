@@ -1,0 +1,34 @@
+{
+  "display_name": "libuvcpp",
+  "language": "C++",
+  "type": "emerging",
+  "mode": "standard",
+  "completeness": {
+    "routing": true,
+    "middleware": true,
+    "request": true,
+    "response": true
+  },
+  "engine": "libuv",
+  "description": "libuvcpp on the libuv event loop, one loop per available core. Routing, path and query params, static files and WebSocket through uvcpp_web_app, nlohmann/json serialization behind uvcpp_json, and gzip through the built-in response compression. HTTP/2 over TLS on 8443 and HTTP/3 on 8443/udp are the same package.",
+  "repo": "https://github.com/Antruly/libuvcpp",
+  "enabled": true,
+  "tests": [
+    "baseline",
+    "pipelined",
+    "limited-conn",
+    "async",
+    "json-comp",
+    "json-tls",
+    "8gbit",
+    "static-tls",
+    "baseline-h2",
+    "static-h2",
+    "baseline-h3",
+    "echo-ws",
+    "latency-1m",
+    "latency-10k",
+    "latency-500k-8cpu"
+  ],
+  "maintainers": ["Antruly"]
+}
