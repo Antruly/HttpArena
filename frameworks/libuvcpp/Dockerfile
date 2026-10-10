@@ -61,7 +61,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # WINDOW_UPDATE, so the bucket is unreachable from these profiles. It is in the
 # pin because it is fixed, not because these numbers depend on it.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
-ARG LIBUVCPP_REF=f9e613f3dc1b2e7855ba6281f873aaf713484563
+ARG LIBUVCPP_REF=852c4806f7c5e46120fba101d0587201dd023f41
 
 ARG OPENSSL_VERSION=3.5.0
 
