@@ -5,12 +5,19 @@ libuvcpp on the libuv event loop, one loop per available core.
 ## Stack
 
 - **Language:** C++11
-- **Library:** libuvcpp 1.6.0 ([repo](https://github.com/Antruly/libuvcpp))
-- **Build:** the official `libuvcpp-1.6.0-linux-x64` release package, compiled
-  with `g++ -std=c++11 -O2 -DNDEBUG` on `ubuntu:24.04`
+- **Library:** libuvcpp 1.6.x ([repo](https://github.com/Antruly/libuvcpp)),
+  built from source in the image
+- **Build:** `cmake -DCMAKE_BUILD_TYPE=Release` on `ubuntu:24.04`, with libuv,
+  llhttp, zlib, nghttp2, ngtcp2, nghttp3 and OpenSSL 3.5 all built statically
+  into `libuvcpp.so`; the entry is `g++ -std=c++11 -O2 -DNDEBUG`
 
-The release package carries libuv, OpenSSL, nghttp2, ngtcp2 and zlib inside
-`libuvcpp.so`, so the image installs no OpenSSL, no HTTP/2 and no QUIC library.
+The library is built from source rather than installed from the published
+`libuvcpp-1.6.x-linux-x64` release package, because that package is built with
+both database backends off — the release workflow asserts it with an `ldd` check
+that fails if `libpq.so` appears — and `/async-db` needs the Postgres backend.
+Everything else about the build follows that same release recipe. OpenSSL is
+built from source as well: its QUIC API (`SSL_set_quic_tls_cbs`) is what the
+HTTP/3 listener needs, and Ubuntu 24.04's own OpenSSL is too old to have it.
 
 ## Listeners
 
@@ -18,7 +25,7 @@ One process opens four listeners, which is what the port map asks for:
 
 | Port | Protocol | Serves |
 |------|----------|--------|
-| 8080 | HTTP/1.1 | `baseline`, `limited-conn`, `pipelined`, `async`, `json-comp`, `echo-ws`, `latency-*` |
+| 8080 | HTTP/1.1 | `baseline`, `limited-conn`, `pipelined`, `async`, `async-db`, `json-comp`, `echo-ws`, `echo-ws-pipeline`, `echo-ws-limited`, `latency-*` |
 | 8081 | TLS, ALPN `http/1.1` | `json-tls`, `8gbit`, `static-tls` |
 | 8443/tcp | TLS, ALPN `h2` | `baseline-h2`, `static-h2` |
 | 8443/udp | QUIC, ALPN `h3` | `baseline-h3` |
@@ -45,6 +52,7 @@ no QUIC API at all. It serves `/baseline2` and nothing else.
 | `/echo` | POST | Returns the request body back verbatim |
 | `/static/*` | GET | Files from the mounted `/data/static` |
 | `/ws` | WS | Echoes text and binary frames back on the same opcode |
+| `/async-db` | GET | Postgres range query, `min`/`max`/`limit` |
 
 ## Notes
 
@@ -61,21 +69,43 @@ no QUIC API at all. It serves `/baseline2` and nothing else.
   answers `Accept-Encoding` per request and adds no `Content-Encoding` when the
   client sends none. The library has no brotli, so `Accept-Encoding: gzip, br`
   returns gzip.
-- **`uvcpp_set_threadpool_size(0)` is called at the top of `main()`**, as
-  `doc/webapp-guide.md` instructs applications to do. The static handler
-  dispatches its file reads through the libuv thread pool, whose default is 4
-  threads regardless of the machine. `0` means "by available CPU count", which
-  is libuv's `uv_available_parallelism()` — so a cpuset-limited container (the
-  `latency-500k-8cpu` profile pins the container to 8 logical CPUs) sizes both
-  the pool and the event loops to the cores it actually has.
-- **`set_log_level(log_level::WARN)` keeps per-request access logging off.** An
-  access line per request at 4096 concurrent connections is a real cost that has
-  nothing to do with serving; warnings and errors — including the framework's
-  4xx/5xx access lines — still print.
+- **The libuv thread pool is sized at the top of `main()`.** Two things ride
+  that one pool: the static handler's file I/O, and every `/async-db` query. The
+  size is the wider of "one thread per available core" (libuv's default is 4
+  regardless of the machine; `latency-500k-8cpu` pins the container to 8 CPUS,
+  and libuv's `uv_available_parallelism()` is cpuset-aware) and
+  `DATABASE_MAX_CONN`, because a libpq call blocks in `recv` — what caps
+  in-flight queries is slots, not cores. libuv spawns pool threads on demand, so
+  the wider figure costs nothing while the pool is idle.
 - **The `/delay/{ms}` reply is a timer on the connection's own loop**, not a
   blocking sleep, so other connections are served while it waits.
 - **`/echo` answers `application/octet-stream`**, which is outside the
   framework's compression set, so the bytes come back unchanged.
+
+### `/async-db`
+
+- **The pool is the library's `uvcpp_db_pool`**, one per process, opened at
+  startup from `DATABASE_URL` and sized from `DATABASE_MAX_CONN` (1..max, max
+  from the variable, defaulting to 256). Not one pool per worker loop: the pool
+  is the thing that owns the connections, and it is written to be called from
+  any thread.
+- **The query is asynchronous**, through `pool.query(loop, sql, params, cb)`.
+  That call borrows a connection, runs the statement and returns the connection
+  — all on a libuv thread-pool thread — and then invokes the callback on the
+  connection's own loop thread. The handler returns before libpq is touched; the
+  reply is written from the callback, which holds a copy of `next` to keep the
+  response alive. Nothing on the event loop ever blocks on the database.
+- **`$1/$2/$3`, not `?`.** libuvcpp's driver does not translate placeholders
+  between dialects, on purpose — `?` is a legal operator in Postgres for jsonb
+  and hstore, so a translation layer could not tell the two apart. This is the
+  entry's only Postgres-specific line.
+- **`tags` is re-parsed.** Postgres returns JSONB as text (OID 3802 is not one
+  of the driver's mapped types, and an unmapped OID degrades to the string libpq
+  returned), and that string *is* the JSON array — so it is parsed back into an
+  array rather than spliced in as a quoted string.
+- **Failure is not fatal and not silent-in-the-wrong-way.** With no
+  `DATABASE_URL`, or a pool that will not open, `/async-db` answers the
+  documented `{"items":[],"count":0}` and the other profiles serve normally.
 
 ### The h3 leg
 
@@ -96,5 +126,5 @@ Two things about 8443/udp are worth stating, because they are deliberate:
 ### Not subscribed
 
 `baseline-h2c` and `json-h2c` (libuvcpp has no cleartext h2), `static-h3` (see
-above), `async-db` / `fortunes` (no database), `unary-grpc` (no gRPC), and the
-gateway / production-stack compose profiles.
+above), `fortunes` (libuvcpp has no HTML template engine), `unary-grpc` (no
+gRPC), and the gateway / production-stack compose profiles.
