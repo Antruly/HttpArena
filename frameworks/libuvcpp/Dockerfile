@@ -35,7 +35,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # The library source, pinned to the v1.6.1 release revision. By commit rather
 # than by tag: a tag can be moved and the bytes under it re-uploaded, so a SHA
-# is the only thing that fixes which revision gets built.
+# is the only thing that fixes which revision gets built. `3fdd6208` is what
+# `v1.6.1` resolves to, and it is the revision the Release workflow builds the
+# six published packages from -- the only thing in it past the version bump is
+# the two READMEs' download tables, so the sources are the ones the fixes
+# describe.
 #
 # Three of the four fixes in 1.6.1 are load-bearing for the profiles this entry
 # subscribes to, and each was measured against the 1.6.0 release package before
@@ -61,7 +65,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # WINDOW_UPDATE, so the bucket is unreachable from these profiles. It is in the
 # pin because it is fixed, not because these numbers depend on it.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
-ARG LIBUVCPP_REF=852c4806f7c5e46120fba101d0587201dd023f41
+ARG LIBUVCPP_REF=3fdd620825bc95d7ae04b8fba276f74162ba4f45
 
 ARG OPENSSL_VERSION=3.5.0
 
