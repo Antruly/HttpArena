@@ -286,6 +286,14 @@ int main() {
   // means "by CPU count", which is what the guide recommends.
   uvcpp_set_threadpool_size(0);
 
+  // Console logging off, wholesale. log_level::OFF is a *threshold*, not a
+  // level: a filtered call site stops after two relaxed atomic reads, before
+  // any stream object exists, so this removes the cost instead of hiding it.
+  // Set globally as well as per app because the HTTP/3 listener is a bare
+  // uvcpp_http_server (the webapp layer has no QUIC support) and so is not
+  // covered by the per-app setting.
+  uvcpp_logger::instance().set_level(log_level::OFF);
+
   load_dataset();
   if (g_dataset.empty()) {
     std::fprintf(stderr, "libuvcpp: dataset is empty -- /json will answer "
@@ -298,9 +306,13 @@ int main() {
   // 8080 -- cleartext HTTP/1.1
   // -------------------------------------------------------------------------
   uvcpp_web_app h1;
+  // set_access_log(false) removes the access-log middleware from the chain
+  // entirely (uvcpp_web_app.cpp:1900 inserts it only when the flag is on).
+  // Left on, it costs a clock read and a response closure per request even with
+  // the output level filtered out.
   h1.set_port(kPortH1)
-      .set_log_level(log_level::WARN);  // access logging off: a line per request
-                                        // costs more than the request does
+      .set_log_level(log_level::OFF)
+      .set_access_log(false);
   h1.set_loops(loops);
 
   h1.get("/baseline11", handle_baseline11);
@@ -329,7 +341,9 @@ int main() {
   uvcpp_web_app h1_tls;
   const bool have_certs = file_exists(kCertFile) && file_exists(kKeyFile);
   if (have_certs) {
-    h1_tls.set_port(kPortH1Tls).set_log_level(log_level::WARN);
+    h1_tls.set_port(kPortH1Tls)
+        .set_log_level(log_level::OFF)
+        .set_access_log(false);
     // Pinned off: static-tls asserts that :8081 negotiates HTTP/1.1 and
     // nothing else.
     h1_tls.set_http2_enabled(false);
@@ -360,7 +374,9 @@ int main() {
   // -------------------------------------------------------------------------
   uvcpp_web_app h2;
   if (have_certs) {
-    h2.set_port(kPortH2).set_log_level(log_level::WARN);
+    h2.set_port(kPortH2)
+        .set_log_level(log_level::OFF)
+        .set_access_log(false);
     h2.set_loops(loops);
     h2.enable_ssl(kCertFile, kKeyFile);  // HTTP/2 is on by default; the ALPN
                                          // list stays the framework's own
