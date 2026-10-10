@@ -1129,6 +1129,20 @@
     "type": "engine",
     "engine": "io_uring"
   },
+  "libuvcpp": {
+    "dir": "libuvcpp",
+    "description": "libuvcpp on the libuv event loop, one loop per available core. Routing, path and query params, static files and WebSocket through uvcpp_web_app, nlohmann/json serialization behind uvcpp_json, and gzip through the built-in response compression. HTTP/2 over TLS on 8443 and HTTP/3 on 8443/udp are the same package.",
+    "repo": "https://github.com/Antruly/libuvcpp",
+    "type": "emerging",
+    "engine": "libuv",
+    "mode": "standard",
+    "completeness": {
+      "routing": true,
+      "middleware": true,
+      "request": true,
+      "response": true
+    }
+  },
   "libxev": {
     "dir": "libxev",
     "description": "HTTP/1.1 baseline server on libxev (mitchellh/libxev) - a Zig event loop with an io_uring backend. Callback-driven accept/read/write with picohttpparser for request parsing; one forked worker per CPU with SO_REUSEPORT.",
