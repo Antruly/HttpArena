@@ -69,9 +69,17 @@ ARG LIBUVCPP_REF=3fdd620825bc95d7ae04b8fba276f74162ba4f45
 
 ARG OPENSSL_VERSION=3.5.0
 
+# `make` is here for OpenSSL, and only for OpenSSL: `./Configure` writes a
+# Makefile whatever generator the project uses, so the `make -j"$(nproc)"` two
+# steps down needs it, and `ninja-build` next to it does not stand in for it.
+# The release workflow's linux legs do not list `make` and do not need to --
+# they run on a GitHub-hosted image, which has build-essential already. A bare
+# ubuntu:24.04 does not: `g++` pulls in gcc, binutils and libc6-dev but not
+# `make`. Measured, not assumed -- the first run of this entry died at
+# `[build 3/8]` with `/bin/sh: 1: make: not found` (exit 127).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        ca-certificates cmake curl g++ git libpq-dev ninja-build \
+        ca-certificates cmake curl g++ git libpq-dev make ninja-build \
  && rm -rf /var/lib/apt/lists/*
 
 # OpenSSL with the QUIC API: static, PIC, no test suite.
