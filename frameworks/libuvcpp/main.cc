@@ -1,9 +1,9 @@
 // libuvcpp entry for HttpArena.
 //
-// Four listeners in one process, one per protocol family the entry subscribes
+// Five listeners in one process, one per protocol family the entry subscribes
 // to:
 //
-//   8080/tcp   cleartext HTTP/1.1        baseline, limited-conn, pipelined,
+//   8080/tcp   cleartext HTTP/1.1 + h2c  baseline, limited-conn, pipelined,
 //                                        async, json-comp, echo-ws, ws-pipeline,
 //                                        ws-limited, async-db, latency-*
 //                                        -- and the backend hop for the
@@ -12,11 +12,17 @@
 //                                        /json/{n} and /async-db here, and
 //                                        production-stack forwards /public/*
 //                                        and /api/* here
+//                                        -- and unary-grpc, whose plaintext leg
+//                                        is prior-knowledge h2c on the same port
+//                                        as h1 (the two are told apart by the
+//                                        24-byte connection preface, not by a
+//                                        port number or an Upgrade dance)
 //   8081/tcp   TLS, ALPN http/1.1        json-tls, 8gbit, static-tls
-//   8443/tcp   TLS, ALPN h2              baseline-h2, static-h2
+//   8082/tcp   cleartext h2c             baseline-h2c, json-h2c
+//   8443/tcp   TLS, ALPN h2              baseline-h2, static-h2, unary-grpc-tls
 //   8443/udp   QUIC, ALPN h3             baseline-h3
 //
-// The three TCP legs are uvcpp_web_app instances. That is the framework's
+// The four TCP legs are uvcpp_web_app instances. That is the framework's
 // documented high-level server, and it is where routing, query and path
 // parameters, static files and WebSocket come from -- the standard-mode rules
 // require the documented high-level API when one exists.
@@ -30,6 +36,8 @@
 
 #include <db/uvcpp_db_pool.h>
 #include <db/uvcpp_db_table.h>
+#include <grpc/uvcpp_grpc.h>
+#include <grpc/uvcpp_grpc_server.h>
 #include <handle/uvcpp_timer.h>
 #include <ssl/uvcpp_ssl_context.h>
 #include <uvcpp/uvcpp_threadpool.h>
@@ -64,8 +72,9 @@ namespace {
 
 const int kPortH1 = 8080;
 const int kPortH1Tls = 8081;
-const int kPortH2 = 8443;  // TCP, TLS + ALPN h2
-const int kPortH3 = 8443;  // UDP, QUIC + ALPN h3
+const int kPortH2c = 8082;  // TCP, cleartext h2 (prior-knowledge)
+const int kPortH2 = 8443;   // TCP, TLS + ALPN h2
+const int kPortH3 = 8443;   // UDP, QUIC + ALPN h3
 
 const char* kCertFile = "/certs/server.crt";
 const char* kKeyFile = "/certs/server.key";
@@ -812,6 +821,56 @@ void handle_baseline2_h3(uvcpp_http_request& req, uvcpp_http_response& resp,
   resp = uvcpp_http_response::ok(body.c_str(), body.size());
 }
 
+// ---------------------------------------------------------------------------
+// unary-grpc -- benchmark.BenchmarkService/GetSum
+// ---------------------------------------------------------------------------
+//
+// The wire shape is the framework's, not the entry's: grpc_parse_unary_body()
+// unwraps the 5-byte length-prefixed frame and grpc_field_get_int32() walks the
+// protobuf message, while grpc_web_send_unary() / grpc_web_send_status() put
+// the response's three sections (HEADERS, DATA, trailers) in order -- the entry
+// only says which fields to read and what to write back. Both gRPC profiles are
+// "two random integers in, their sum out", so the handler is a handful of lines
+// with no framing, no varint and no trailer construction in it.
+//
+// That is the standard-mode argument in one place. The gRPC module is the
+// library's documented high-level API for this, and hand-rolling the encoder
+// here would be exactly the "build a faster path around the framework" the
+// rules forbid.
+//
+// SumRequest is `{int32 a = 1; int32 b = 2;}`, SumReply is `{int32 result = 1;}`.
+// proto3 omits a field whose value is 0 and grpc_field_get_int32() answers
+// UV_ENOENT for an absent one -- which is not an error, it is the default, and
+// the out-param already holds it. The two addresses are never 0 in this profile,
+// but reading the default that way is what makes the handler right for the wire
+// format rather than right only for the benchmark.
+//
+// A malformed body does not go through the normal path at all: the parser hands
+// back the status code it decided on (INVALID_ARGUMENT for a broken frame,
+// RESOURCE_EXHAUSTED for an oversized one) plus the sentence for `grpc-message`,
+// so the handler never repeats that table. The reply is Trailers-Only -- HTTP
+// 200, no body, the conclusion in the trailing block -- which is why the entry
+// does not set a status code here.
+void handle_grpc_sum(uvcpp_web_request& req, uvcpp_web_response& resp,
+                     uvcpp_web_next) {
+  std::string message;
+  std::string err;
+  grpc_status fail_status = grpc_status::INTERNAL;
+  if (grpc_parse_unary_body(req.body_str(), message, fail_status, err) != 0) {
+    grpc_web_send_status(resp, fail_status, err);
+    return;
+  }
+
+  int32_t a = 0;
+  int32_t b = 0;
+  grpc_field_get_int32(message.data(), message.size(), 1, a);
+  grpc_field_get_int32(message.data(), message.size(), 2, b);
+
+  std::string reply;
+  grpc_field_put_int32(reply, 1, a + b);
+  grpc_web_send_unary(resp, reply);
+}
+
 }  // namespace
 
 int main() {
@@ -850,7 +909,7 @@ int main() {
   const int loops = worker_loops();
 
   // -------------------------------------------------------------------------
-  // 8080 -- cleartext HTTP/1.1
+  // 8080 -- cleartext HTTP/1.1 + h2c
   // -------------------------------------------------------------------------
   uvcpp_web_app h1;
   // set_access_log(false) removes the access-log middleware from the chain
@@ -860,6 +919,14 @@ int main() {
   h1.set_port(kPortH1)
       .set_log_level(log_level::OFF)
       .set_access_log(false);
+  // Both protocols on one port, separated by the first 24 bytes of each
+  // connection: the RFC 9113 preface is byte-exact, so this is a decision and
+  // not a guess, and it settles once per connection -- a connection that starts
+  // with anything else is HTTP/1.1 for the rest of its life and pays nothing
+  // further (uvcpp_http_server.h:377). What it buys is unary-grpc's plaintext
+  // leg, whose URL names this very port (`http://localhost:8080`), without
+  // opening a second one for the h1 profiles to trip over.
+  h1.set_h2c_enabled(true);
   h1.set_loops(loops);
 
   h1.get("/baseline11", handle_baseline11);
@@ -913,6 +980,17 @@ int main() {
     handle_api_me(&h1, req, resp, next);
   });
 
+  // ---------------------------------------------------------------------
+  // unary-grpc -- h2c on this port
+  // ---------------------------------------------------------------------
+  //
+  // Registered on h1 as well as on 8443 because the two gRPC profiles name the
+  // same service on two transports: unary-grpc over h2c here, unary-grpc-tls
+  // over TLS on 8443. A route is one row in the router regardless of which
+  // connection it arrives on, so the same line serves both -- what differs is
+  // only which listener the client reached.
+  h1.post("/benchmark.BenchmarkService/GetSum", handle_grpc_sum);
+
   // Every route is registered above, before start(): with set_loops(n > 1)
   // registering afterwards races on the process-shared chain cache.
   const int rc_h1 = h1.start_background();
@@ -957,6 +1035,38 @@ int main() {
   }
 
   // -------------------------------------------------------------------------
+  // 8082 -- cleartext h2c (prior-knowledge)
+  // -------------------------------------------------------------------------
+  //
+  // The platform's dedicated h2c port (scripts/validate.sh sets H2C_PORT=8082),
+  // so the h2c profiles never share a port with h1 and never need the preface
+  // split above. Both routes already exist on other listeners -- /baseline2 and
+  // /json/{n} are the same handlers -- and h2load is explicit about the
+  // protocol (`-p h2c`), so a server that quietly answered HTTP/1.1 here would
+  // be caught rather than scored.
+  //
+  // No certificate gate: this leg is cleartext, so it comes up whether or not
+  // /certs is mounted.
+  uvcpp_web_app h2c;
+  h2c.set_port(kPortH2c)
+      .set_log_level(log_level::OFF)
+      .set_access_log(false);
+  h2c.set_h2c_enabled(true);
+  h2c.set_loops(loops);
+
+  h2c.get("/baseline2", handle_baseline2);
+  h2c.get("/json/:count", handle_json);
+
+  {
+    const int rc = h2c.start_background();
+    if (rc != 0) {
+      std::fprintf(stderr, "libuvcpp: cannot listen on %d (rc=%d)\n", kPortH2c,
+                   rc);
+      return 1;
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // 8443/tcp -- TLS, ALPN h2
   // -------------------------------------------------------------------------
   uvcpp_web_app h2;
@@ -971,6 +1081,8 @@ int main() {
 
     h2.get("/baseline2", handle_baseline2);
     h2.serve_static("/static", kStaticRoot);
+    // unary-grpc-tls: the same service the h2c leg answers, reached over TLS.
+    h2.post("/benchmark.BenchmarkService/GetSum", handle_grpc_sum);
 
     const int rc = h2.start_background();
     if (rc != 0) {
@@ -1013,6 +1125,7 @@ int main() {
   }
 
   h1.stop();
+  h2c.stop();
   if (have_certs) {
     h1_tls.stop();
     h2.stop();
