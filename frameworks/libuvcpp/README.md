@@ -97,8 +97,20 @@ certificates mounted, so this is the only port it opens, and the edge proxy owns
   Nothing is pre-serialized or cached.
 - **Compression is the framework's built-in response compression** (gzip), which
   answers `Accept-Encoding` per request and adds no `Content-Encoding` when the
-  client sends none. The library has no brotli, so `Accept-Encoding: gzip, br`
-  returns gzip.
+  client sends none. The library has no brotli compressor, so an `Accept-Encoding:
+  br, gzip` request is answered with gzip for anything the handler compresses
+  live.
+- **Where the dataset ships a pre-compressed twin, the handler serves it**
+  (`precompressed`, on for every static leg). 15 of the dataset's 20 assets carry
+  a `.br` and a `.gz` beside them, and the static profiles send
+  `Accept-Encoding: br;q=1, gzip;q=0.8`, so those 15 go out as the shipped
+  brotli file with `Content-Encoding: br` and `Vary: Accept-Encoding`. This is
+  the same thing every other entry does — nginx `gzip_static`, Caddy
+  `precompressed br gzip` (which this entry's own edge Caddyfiles already use),
+  actix `try_compressed()` — and the entry neither produces nor caches those
+  files: it is the framework's option, pointed at the dataset as mounted. A
+  request for a file with no twin, or one that sends no `Accept-Encoding`, or a
+  `Range` request, gets the live path unchanged.
 - **The libuv thread pool is sized at the top of `main()`.** Two things ride
   that one pool: the static handler's file I/O, and every `/async-db` query. The
   size is the wider of "one thread per available core" (libuv's default is 4
@@ -172,7 +184,12 @@ Three things about 8443/udp are worth stating, because they are deliberate:
   web-layer static server is reachable only through `uvcpp_web_app`, which has
   no QUIC API at all, so the h3 leg cannot use it. Both revalidate against the
   file's size and `mtime` per request, so a replaced file is served immediately
-  on either.
+  on either. Both also take `precompressed`, from the same shared rule (the two
+  servers call one `http_pick_precompressed_variants()`), so the twin a request
+  gets does not depend on which leg answers it. Turning it on matters far more
+  here than on the `uvcpp_web_app` legs: `uvcpp_static_server` has no
+  compressed-variant cache, so without it the handler runs zlib over the whole
+  file on the loop thread once per request.
 
 ### The compose stacks
 

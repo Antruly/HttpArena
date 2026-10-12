@@ -37,12 +37,25 @@ ENV DEBIAN_FRONTEND=noninteractive
 # and the bytes under it re-uploaded, so a SHA is the only thing that fixes
 # which revision gets built. `3fdd6208` was `v1.6.1` -- what the first version
 # of this entry built, and what the platform measured. The pin is now
-# `0528b4a6`, the tip of the 1.6.x line (`1.6.13-dev`), because the profiles
+# `8cce146a`, the tip of the 1.6.x line (`1.6.18-dev`), because the profiles
 # this entry subscribes to need code no release carries yet: cleartext h2, the
-# h3 static handler, gRPC and the h3 CID fix all landed after `v1.6.4`. Each
-# was measured against the previous pin before being taken.
+# h3 static handler, gRPC, the h3 CID fix and the on-disk pre-compressed twins
+# all landed after `v1.6.4`. Each was measured against the previous pin before
+# being taken.
 #
 # What this pin carries that these profiles depend on, by family:
+#
+#   static -- serving the on-disk `.br` / `.gz` twin of a file instead of
+#     deflating it per request (`precompressed`, on for every static leg this
+#     entry mounts: h1-tls, h2 and h3). `uvcpp_static_server` -- which is what
+#     the h3 leg uses, there being no `uvcpp_web_app` listener on QUIC -- did not
+#     even have a compressed-variant cache, so it ran zlib over the whole file on
+#     the loop thread once per request: 933 -> 82,451 rps on the entry's own
+#     `data/static` (8 loops, `h2load -p http/1.1 -c 64 -m 2 -n 8000`), while the
+#     bytes on the wire fell 24.5%. The `uvcpp_web_app` legs, which already
+#     cached the deflated variant, gain +67% and 23.7% fewer bytes. `font/woff`
+#     and `font/woff2` also left the MIME table: those containers hold compressed
+#     streams, and re-deflating them produced *bigger* output.
 #
 #   h3 -- `fix(quic): 短包头按「本端 scid_len」解 DCID`. The server decoded a
 #     short-header DCID with the *peer's* SCID length, so after the handshake
@@ -79,7 +92,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # `perf(web): 压缩不再每请求新建一个 deflate 内核` (+2.4% on json-comp,
 # non-overlapping over 5 alternating rounds each way) is folded in as well.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
-ARG LIBUVCPP_REF=0528b4a67b3dc7f4783056fa9d3cfa134407cf9c
+ARG LIBUVCPP_REF=8cce146aca6e0ba18c3daaea885443f8171a7686
 
 ARG OPENSSL_VERSION=3.5.0
 

@@ -52,6 +52,7 @@
 #include <webapp/uvcpp_web_json.h>
 #include <webapp/uvcpp_web_request.h>
 #include <webapp/uvcpp_web_response.h>
+#include <webapp/uvcpp_web_static.h>
 #include <webapp/uvcpp_web_ws.h>
 
 #include <unistd.h>
@@ -84,6 +85,58 @@ const char* kCertFile = "/certs/server.crt";
 const char* kKeyFile = "/certs/server.key";
 const char* kDatasetFile = "/data/dataset.json";
 const char* kStaticRoot = "/data/static";
+
+/// Static options shared by the two `uvcpp_web_app` legs (:8081 and :8443/tcp).
+///
+/// `precompressed` is the whole reason this is a named object rather than the
+/// default argument. The dataset ships a `.br` and a `.gz` twin beside 15 of
+/// its 20 text assets, and every static request these profiles send carries
+/// `Accept-Encoding: br;q=1, gzip;q=0.8` -- so for those 15 the same resource
+/// goes out from the shipped brotli twin instead of from a live deflate of the
+/// original.
+///
+/// Measured on the dev box (8 loops, `h2load -p http/1.1 -c 64 -m 2 -n 8000`
+/// over the 20-file rotation, three reps each, dataset copied to ext4 for the
+/// reason in the last paragraph):
+///
+///   leg                             off          on           bytes / 8000 req
+///   uvcpp_web_app::serve_static     110,773 rps  185,280 rps  172,797,487 -> 131,865,720
+///   uvcpp_static_server  (h3 leg)   933.15 rps   82,451 rps   173,843,446 -> 131,194,904
+///
+/// The byte column is filesystem-independent. The 20 originals total
+/// 1,271,603 B; the 15 twinned files are 224,029 B of brotli against 262,407 B
+/// of gzip, and the 5 webp/woff2 files (101,376 B) have no twin and go out
+/// as-is. Note that "off" is *not* the originals: it is the server's live gzip,
+/// which costs both a full deflate per request on the loop thread and more
+/// bytes per round (426 KB) than the shipped `.gz` twins (363,783 B) -- the
+/// live compressor is configured for latency, not for size. The web_app legs
+/// cache their compressed variant, so they only see the byte saving; the h3
+/// leg is a `uvcpp_static_server`, which has no such cache, and 933 -> 82,451
+/// rps is entirely that deflate.
+///
+/// The rps column has to be read together with the filesystem the dataset
+/// lives on. The dev box's own copy is on an ntfs-3g (FUSE) mount where one
+/// stat() costs 45.9 us; the same 50 files on ext4 cost 1.35 us, 34x less.
+/// Turning this on adds one stat() per request to probe the twin candidate, so
+/// on ntfs-3g that probe is the whole bottleneck (32,448 rps there -- *slower*
+/// than off) and the numbers above only appear on ext4. The platform mounts the
+/// dataset into the container, so the ext4 numbers are the representative ones.
+///
+/// It is also what every other entry in this arena does -- nginx `gzip_static`,
+/// Caddy `precompressed br gzip`, actix `try_compressed()` -- and what this
+/// entry's own `proxy/Caddyfile` and `proxy-production/Caddyfile` already ask
+/// their edges for. Left off, the direct legs would be the only place in the
+/// whole entry serving a live deflate.
+///
+/// Off by default in `uvcpp_web_static_options`, so it has to be turned on
+/// explicitly. `:8443/udp` (static-h3) is a `uvcpp_http_server` +
+/// `uvcpp_static_server`, not a `uvcpp_web_app`, so it does not take this
+/// object; it has its own `set_precompressed()`, turned on below.
+uvcpp_web_static_options kStaticOpts = [] {
+  uvcpp_web_static_options o;
+  o.precompressed = true;
+  return o;
+}();
 
 /// The 50-item dataset, read once at startup. Read-only afterwards, so every
 /// worker loop can share it without a lock.
@@ -1021,7 +1074,7 @@ int main() {
 
     h1_tls.get("/json/:count", handle_json);
     h1_tls.post("/echo", handle_echo);
-    h1_tls.serve_static("/static", kStaticRoot);
+    h1_tls.serve_static("/static", kStaticRoot, kStaticOpts);
 
     const int rc = h1_tls.start_background();
     if (rc != 0) {
@@ -1084,7 +1137,7 @@ int main() {
                                          // {h2, http/1.1}.
 
     h2.get("/baseline2", handle_baseline2);
-    h2.serve_static("/static", kStaticRoot);
+    h2.serve_static("/static", kStaticRoot, kStaticOpts);
     // unary-grpc-tls: the same service the h2c leg answers, reached over TLS.
     h2.post("/benchmark.BenchmarkService/GetSum", handle_grpc_sum);
 
@@ -1109,6 +1162,12 @@ int main() {
   // on, a missing file would come back as index.html with a 200 and the three
   // static profiles would disagree about what a miss is.
   h3_static.set_spa_fallback(false);
+  // Same twin rule as the h1/h2 legs above, but through uvcpp_static_server's
+  // own set_precompressed(): this leg is a plain uvcpp_http_server, so there is
+  // no uvcpp_web_static_options to pass. Without it this leg deflates every
+  // response on the loop thread -- 933.15 rps against 82,451 with it, on the
+  // rig described above kStaticOpts.
+  h3_static.set_precompressed(true);
   uvcpp_http_server h3;
   if (have_certs) {
     if (!quic_tls.load_certificate_file(kCertFile) ||
