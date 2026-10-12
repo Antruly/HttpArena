@@ -15,9 +15,16 @@ The library is built from source rather than installed from the published
 `libuvcpp-1.6.x-linux-x64` release package, because that package is built with
 both database backends off — the release workflow asserts it with an `ldd` check
 that fails if `libpq.so` appears — and `/async-db` needs the Postgres backend.
-Everything else about the build follows that same release recipe. OpenSSL is
-built from source as well: its QUIC API (`SSL_set_quic_tls_cbs`) is what the
-HTTP/3 listener needs, and Ubuntu 24.04's own OpenSSL is too old to have it.
+Everything else about the build follows that same release recipe. One thing the
+package carries that `cmake --install` does not: `include/zlib.h` and
+`include/zconf.h`, patched in by `tests/tools/package_release.py` because the
+install rules have no such entry — and `web/uvcpp_ws_parser.h` includes
+`<zlib.h>` whenever `UVCPP_ZLIB_ENABLE` is 1, which `uvcpp_config.h` sets
+unconditionally. The image therefore installs `zlib1g-dev`: the header is needed
+to compile the entry, while the zlib the library runs on is still the static one
+from that recipe. OpenSSL is built from source as well: its QUIC API
+(`SSL_set_quic_tls_cbs`) is what the HTTP/3 listener needs, and Ubuntu 24.04's
+own OpenSSL is too old to have it.
 
 ## Listeners
 

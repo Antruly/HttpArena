@@ -77,9 +77,24 @@ ARG OPENSSL_VERSION=3.5.0
 # ubuntu:24.04 does not: `g++` pulls in gcc, binutils and libc6-dev but not
 # `make`. Measured, not assumed -- the first run of this entry died at
 # `[build 3/8]` with `/bin/sh: 1: make: not found` (exit 127).
+#
+# `zlib1g-dev` is not for the library build either -- that one fetches zlib and
+# links it in statically (`-DCMAKE_DISABLE_FIND_PACKAGE_ZLIB=ON` below), so
+# nothing in those steps reads zlib's headers. It is for the *last* step: the
+# installed public header `web/uvcpp_ws_parser.h` does `#include <zlib.h>` under
+# `#if UVCPP_ZLIB_ENABLE`, and the generated `uvcpp_config.h` defines that to 1
+# (with an `#error` against defining it to 0 yourself), so a consumer compiling
+# against `/opt/uvcpp/include` cannot opt out of it. The release packages carry
+# `include/zlib.h` + `include/zconf.h` -- `tests/tools/package_release.py` says
+# in as many words that the install rules have no such entry -- and `cmake
+# --install` from source does not; the library's own release workflow installs
+# this same package for that side. That is exactly why the published-package
+# revision of this entry built and this one did not. Measured: `[build 8/8]`
+# died with `/opt/uvcpp/include/web/uvcpp_ws_parser.h:31:10: fatal error:
+# zlib.h: No such file or directory`.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        ca-certificates cmake curl g++ git libpq-dev make ninja-build \
+        ca-certificates cmake curl g++ git libpq-dev make ninja-build zlib1g-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # OpenSSL with the QUIC API: static, PIC, no test suite.
