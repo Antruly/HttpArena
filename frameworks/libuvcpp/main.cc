@@ -20,7 +20,7 @@
 //   8081/tcp   TLS, ALPN http/1.1        json-tls, 8gbit, static-tls
 //   8082/tcp   cleartext h2c             baseline-h2c, json-h2c
 //   8443/tcp   TLS, ALPN h2              baseline-h2, static-h2, unary-grpc-tls
-//   8443/udp   QUIC, ALPN h3             baseline-h3
+//   8443/udp   QUIC, ALPN h3             baseline-h3, static-h3
 //
 // The four TCP legs are uvcpp_web_app instances. That is the framework's
 // documented high-level server, and it is where routing, query and path
@@ -28,11 +28,14 @@
 // require the documented high-level API when one exists.
 //
 // The QUIC leg goes through the low-level uvcpp_http_server because
-// uvcpp_web_app has no QUIC support at all. It serves the single endpoint
-// baseline-h3 needs and nothing else: one synchronous handler, no static
-// route, no stream route, no deferred response. Those three are the things the
-// h3 path cannot honour (it answers 500 and says so), so the h3 leg is kept
-// clear of every one of them.
+// uvcpp_web_app has no QUIC support at all. It subscribes both h3 profiles:
+// /baseline2 as a route, and the static tree through uvcpp_static_server
+// mounted as the fallback handler -- uvcpp_http_server has no serve_static()
+// of its own (that one belongs to uvcpp_web_app), and uvcpp_static_server
+// answers from the thread pool, which means a deferred reply. The h3 dispatch
+// path accepts those. The two profiles are the whole of what this leg answers:
+// no stream route, no WebSocket, and set_stream_claim/post_stream still answer
+// 500 on h3.
 
 #include <db/uvcpp_db_pool.h>
 #include <db/uvcpp_db_table.h>
@@ -42,6 +45,7 @@
 #include <ssl/uvcpp_ssl_context.h>
 #include <uvcpp/uvcpp_threadpool.h>
 #include <web/uvcpp_http_server.h>
+#include <web/uvcpp_static_server.h>
 #include <web/uvcpp_ws_connection.h>
 #include <webapp/uvcpp_log.h>
 #include <webapp/uvcpp_web_app.h>
@@ -1096,6 +1100,15 @@ int main() {
   // 8443/udp -- QUIC, ALPN h3
   // -------------------------------------------------------------------------
   uvcpp_ssl_context quic_tls(tls_mode::SERVER, tls_version::TLS_1_3);
+  // Declared before h3 on purpose: the handler it hands out captures `this`,
+  // so it has to outlive the server (the destructor order of locals is the
+  // reverse of this line's).
+  uvcpp_static_server h3_static(kStaticRoot, "/static");
+  // Off, to match the h1/h2 legs: uvcpp_web_static_options defaults
+  // spa_fallback to false, while uvcpp_static_server defaults it to true. Left
+  // on, a missing file would come back as index.html with a 200 and the three
+  // static profiles would disagree about what a miss is.
+  h3_static.set_spa_fallback(false);
   uvcpp_http_server h3;
   if (have_certs) {
     if (!quic_tls.load_certificate_file(kCertFile) ||
@@ -1104,9 +1117,16 @@ int main() {
       return 1;
     }
     // Order matters: the context has to be in place before listen_quic(), and
-    // QUIC has no cleartext mode to fall back on.
+    // QUIC has no cleartext mode to fall back on; set_loops() has to come
+    // before both (it answers UV_EBUSY once the endpoint exists).
     h3.set_quic_ssl_context(&quic_tls);
     h3.get("/baseline2", handle_baseline2_h3);
+    // static-h3: the same tree the h1/h2 legs serve. on_request() is the
+    // no-route-match handler, so /baseline2 above still wins and everything
+    // else is looked up on disk -- which is exactly what the profile asks for
+    // (/static/*, and a 404 rather than the fallback page for a miss).
+    h3.on_request(h3_static.handler(&h3));
+    h3.set_loops(loops);
     const int rc = h3.listen_quic(kPortH3);
     if (rc != 0) {
       std::fprintf(stderr, "libuvcpp: cannot listen on %d/udp (rc=%d)\n",
@@ -1115,9 +1135,11 @@ int main() {
     }
   }
 
-  // The QUIC endpoint is not multi-loop: uvcpp_quic_server has one loop, and
-  // it is the same one run()/stop() manage. So the main thread runs it, and
-  // every TCP leg above is already serving on its own threads.
+  // run() drives the acceptor's loop on this thread. With set_loops(n > 1) the
+  // QUIC endpoints fan out to n-1 worker loops, each on its own thread and each
+  // bound to the same port with SO_REUSEPORT, so the kernel hashes connections
+  // across them; they take the same `loops` value the TCP legs above took, and
+  // every TCP leg is already serving on its own threads by this point.
   if (have_certs) {
     h3.run();
   } else {

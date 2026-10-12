@@ -33,39 +33,53 @@ FROM ubuntu:24.04 AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# The library source, pinned to the v1.6.1 release revision. By commit rather
-# than by tag: a tag can be moved and the bytes under it re-uploaded, so a SHA
-# is the only thing that fixes which revision gets built. `3fdd6208` is what
-# `v1.6.1` resolves to, and it is the revision the Release workflow builds the
-# six published packages from -- the only thing in it past the version bump is
-# the two READMEs' download tables, so the sources are the ones the fixes
-# describe.
+# The library source, pinned by commit rather than by tag: a tag can be moved
+# and the bytes under it re-uploaded, so a SHA is the only thing that fixes
+# which revision gets built. `3fdd6208` was `v1.6.1` -- what the first version
+# of this entry built, and what the platform measured. The pin is now
+# `0528b4a6`, the tip of the 1.6.x line (`1.6.13-dev`), because the profiles
+# this entry subscribes to need code no release carries yet: cleartext h2, the
+# h3 static handler, gRPC and the h3 CID fix all landed after `v1.6.4`. Each
+# was measured against the previous pin before being taken.
 #
-# Three of the four fixes in 1.6.1 are load-bearing for the profiles this entry
-# subscribes to, and each was measured against the 1.6.0 release package before
-# being taken:
+# What this pin carries that these profiles depend on, by family:
 #
-#   `fix(quic): 流关闭时把额度还给对端` -- without it a QUIC connection stops
-#     being served after 100 requests (the server never re-sends MAX_STREAMS).
-#     h2load opens one connection for the whole baseline-h3 run, so the run was
-#     collapsing partway through.
-#   `fix(webapp): 在途上限不再套在 h2 上` -- the default `max_pipelined_requests`
-#     of 8 was applied to h2 streams as well as to h1 pipelining, so a compliant
-#     client was answered with `503` + `connection: close` once 8 responses were
-#     in flight. Measured locally against the 1.6.0 package at the static-h2
-#     shape: 578,096 of 742,441 requests answered 503 (78%); after the fix, 49
-#     to 289 of ~163,000 (~0.1%). This is the one that moves the score.
-#   `perf(web): 压缩不再每请求新建一个 deflate 内核` -- +2.4% on json-comp
-#     (non-overlapping, 5 alternating rounds each way).
+#   h3 -- `fix(quic): 短包头按「本端 scid_len」解 DCID`. The server decoded a
+#     short-header DCID with the *peer's* SCID length, so after the handshake
+#     every 1-RTT packet was read as an unknown CID and dropped. On the platform
+#     the baseline-h3 run answered 294 responses in its 5 s window -- 4.6 per
+#     connection, i.e. one initial PTO per request -- against 9,086,240 rps from
+#     the leader on the same box. Locally the same rig goes 63 -> 86,000 req/s
+#     with this one line. `fix(quic): 流关闭时把额度还给对端` stops a connection
+#     from dying at 100 requests (the server never re-sent MAX_STREAMS), and
+#     `feat(quic): QUIC 端点也能扇到多条循环上` gives the endpoint one socket
+#     per loop under SO_REUSEPORT. Both are in this pin.
+#   h2 -- `fix(webapp): 在途上限不再套在 h2 上`. The default
+#     `max_pipelined_requests` of 8 was applied to h2 streams as well as to h1
+#     pipelining, so a compliant client was answered `503` + `connection: close`
+#     once 8 responses were in flight. Measured locally against the 1.6.0
+#     package at the static-h2 shape: 578,096 of 742,441 requests answered 503
+#     (78%); after the fix, 49 to 289 of ~163,000 (~0.1%). This is the one that
+#     moved the h2 score.
+#   h2c and gRPC -- `feat(web): 明文 h2` (prior-knowledge h2c on a cleartext
+#     listener, off by default) and the four `feat(grpc)` commits: the
+#     length-prefixed frame, the varint field walk, and the `grpc-status`
+#     trailer that h2 had to learn to send first. No release has either.
+#   static-h3 -- `feat(web): h3 上的稍后应答`. h3 dispatch rejected a deferred
+#     response with a 500, which is what kept the static handler off QUIC.
 #
-# The fourth, `fix(http2): WINDOW_UPDATE 不再算进控制帧预算`, is a real bug (a
-# 32 frame/s bucket counted WINDOW_UPDATE, capping a connection at ~1 MiB/s when
-# the peer honours its own flow control) but it does **not** show up here:
-# h2load raises its flow-control window to 2^30-1 and never sends a
-# WINDOW_UPDATE, so the bucket is unreachable from these profiles. It is in the
-# pin because it is fixed, not because these numbers depend on it.
+# Three more are in the pin because they are fixed, not because these numbers
+# depend on them. `fix(http2): WINDOW_UPDATE 不再算进控制帧预算` capped a
+# connection at ~1 MiB/s when the peer honours its own flow control, but h2load
+# raises its window to 2^30-1 and never sends a WINDOW_UPDATE, so the bucket is
+# unreachable from these profiles. `perf(net): 接受连接时默认关 Nagle` is real --
+# an h2 reply is written as two segments, and an idle peer's 40 ms delayed ACK
+# parks the second -- but it only bites at one request in flight per connection,
+# and these profiles run `-m 32` and `-m 100`, where the two arms overlap.
+# `perf(web): 压缩不再每请求新建一个 deflate 内核` (+2.4% on json-comp,
+# non-overlapping over 5 alternating rounds each way) is folded in as well.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
-ARG LIBUVCPP_REF=3fdd620825bc95d7ae04b8fba276f74162ba4f45
+ARG LIBUVCPP_REF=0528b4a67b3dc7f4783056fa9d3cfa134407cf9c
 
 ARG OPENSSL_VERSION=3.5.0
 
@@ -78,23 +92,22 @@ ARG OPENSSL_VERSION=3.5.0
 # `make`. Measured, not assumed -- the first run of this entry died at
 # `[build 3/8]` with `/bin/sh: 1: make: not found` (exit 127).
 #
-# `zlib1g-dev` is not for the library build either -- that one fetches zlib and
-# links it in statically (`-DCMAKE_DISABLE_FIND_PACKAGE_ZLIB=ON` below), so
-# nothing in those steps reads zlib's headers. It is for the *last* step: the
-# installed public header `web/uvcpp_ws_parser.h` does `#include <zlib.h>` under
-# `#if UVCPP_ZLIB_ENABLE`, and the generated `uvcpp_config.h` defines that to 1
-# (with an `#error` against defining it to 0 yourself), so a consumer compiling
-# against `/opt/uvcpp/include` cannot opt out of it. The release packages carry
-# `include/zlib.h` + `include/zconf.h` -- `tests/tools/package_release.py` says
-# in as many words that the install rules have no such entry -- and `cmake
-# --install` from source does not; the library's own release workflow installs
-# this same package for that side. That is exactly why the published-package
-# revision of this entry built and this one did not. Measured: `[build 8/8]`
-# died with `/opt/uvcpp/include/web/uvcpp_ws_parser.h:31:10: fatal error:
-# zlib.h: No such file or directory`.
+# `zlib1g-dev` was listed here at the `v1.6.1` pin and has been dropped, because
+# the install rules ship the headers themselves as of 1.6.3. The reason it was
+# listed: the library fetches zlib and links it in statically
+# (`-DCMAKE_DISABLE_FIND_PACKAGE_ZLIB=ON` below), so nothing on the system path
+# provides `zlib.h` -- yet the installed public header `web/uvcpp_ws_parser.h`
+# does `#include <zlib.h>` under `#if UVCPP_ZLIB_ENABLE`, and the generated
+# `uvcpp_config.h` defines that to 1 (with an `#error` against defining it to 0
+# yourself), so a consumer compiling against `/opt/uvcpp/include` cannot opt out
+# of it. Before the fix, `[build 8/8]` died with
+# `/opt/uvcpp/include/web/uvcpp_ws_parser.h:31:10: fatal error: zlib.h: No such
+# file or directory`. Confirmed against this pin rather than assumed: `g++ -H`
+# resolves `<zlib.h>` to `<prefix>/include/zlib.h`, and it keeps resolving there
+# with the package gone, since `-I` is searched before the system directories.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        ca-certificates cmake curl g++ git libpq-dev make ninja-build zlib1g-dev \
+        ca-certificates cmake curl g++ git libpq-dev make ninja-build \
  && rm -rf /var/lib/apt/lists/*
 
 # OpenSSL with the QUIC API: static, PIC, no test suite.
@@ -191,10 +204,10 @@ RUN apt-get update \
 COPY --from=build /opt/uvcpp/lib/libuvcpp.so /opt/uvcpp/lib/libuvcpp.so
 COPY --from=build /server /server
 
-# 8080 HTTP/1.1, 8081 HTTPS/1.1, 8443 TCP+TLS for h2 and 8443 UDP for h3. The
-# benchmark reaches these through --network host, where EXPOSE is documentation;
-# the validation harness publishes them with -p on a bridge network, and that is
-# where the two 8443 entries stop being one line.
-EXPOSE 8080 8081 8443 8443/udp
+# 8080 HTTP/1.1 + h2c, 8081 HTTPS/1.1, 8082 h2c, 8443 TCP+TLS for h2 and 8443
+# UDP for h3. The benchmark reaches these through --network host, where EXPOSE is
+# documentation; the validation harness publishes them with -p on a bridge
+# network, and that is where the two 8443 entries stop being one line.
+EXPOSE 8080 8081 8082 8443 8443/udp
 
 CMD ["/server"]

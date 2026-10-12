@@ -15,40 +15,51 @@ The library is built from source rather than installed from the published
 `libuvcpp-1.6.x-linux-x64` release package, because that package is built with
 both database backends off — the release workflow asserts it with an `ldd` check
 that fails if `libpq.so` appears — and `/async-db` needs the Postgres backend.
-Everything else about the build follows that same release recipe. One thing the
-package carries that `cmake --install` does not: `include/zlib.h` and
-`include/zconf.h`, patched in by `tests/tools/package_release.py` because the
-install rules have no such entry — and `web/uvcpp_ws_parser.h` includes
-`<zlib.h>` whenever `UVCPP_ZLIB_ENABLE` is 1, which `uvcpp_config.h` sets
-unconditionally. The image therefore installs `zlib1g-dev`: the header is needed
-to compile the entry, while the zlib the library runs on is still the static one
-from that recipe. OpenSSL is built from source as well: its QUIC API
-(`SSL_set_quic_tls_cbs`) is what the HTTP/3 listener needs, and Ubuntu 24.04's
-own OpenSSL is too old to have it.
+Everything else about the build follows that same release recipe. The pinned
+revision installs `include/zlib.h` and `include/zconf.h` along with the library,
+which matters because `web/uvcpp_ws_parser.h` includes `<zlib.h>` whenever
+`UVCPP_ZLIB_ENABLE` is 1 — and `uvcpp_config.h` sets that unconditionally, so a
+consumer cannot opt out of it. At the older `v1.6.1` pin the install rules had
+no such entry and the image carried `zlib1g-dev` to compensate; the headers are
+now part of what `cmake --install` writes, so that package is gone. OpenSSL is
+built from source as well: its QUIC API (`SSL_set_quic_tls_cbs`) is what the
+HTTP/3 listener needs, and Ubuntu 24.04's own OpenSSL is too old to have it.
 
 ## Listeners
 
-One process opens four listeners, which is what the port map asks for:
+One process opens five listeners:
 
 | Port | Protocol | Serves |
 |------|----------|--------|
-| 8080 | HTTP/1.1 | `baseline`, `limited-conn`, `pipelined`, `async`, `async-db`, `json-comp`, `echo-ws`, `echo-ws-pipeline`, `echo-ws-limited`, `latency-*` |
+| 8080 | HTTP/1.1 + prior-knowledge `h2c` | `baseline`, `limited-conn`, `pipelined`, `async`, `async-db`, `json-comp`, `echo-ws`, `echo-ws-pipeline`, `echo-ws-limited`, `latency-*`, `unary-grpc` |
 | 8081 | TLS, ALPN `http/1.1` | `json-tls`, `8gbit`, `static-tls` |
-| 8443/tcp | TLS, ALPN `h2` | `baseline-h2`, `static-h2` |
-| 8443/udp | QUIC, ALPN `h3` | `baseline-h3` |
+| 8082 | cleartext `h2c` | `baseline-h2c`, `json-h2c` |
+| 8443/tcp | TLS, ALPN `h2` | `baseline-h2`, `static-h2`, `unary-grpc-tls` |
+| 8443/udp | QUIC, ALPN `h3` | `baseline-h3`, `static-h3` |
 
-The first three are `uvcpp_web_app` instances — the library's documented
+The four TCP legs are `uvcpp_web_app` instances — the library's documented
 high-level server, and where routing, path and query parameters, static files
 and WebSocket come from. HTTP/2 is on by default once `enable_ssl` is called, so
 8443 uses the framework's own ALPN list; 8081 pins `set_http2_enabled(false)` so
 it cannot answer h2.
 
-The QUIC leg is the low-level `uvcpp_http_server`, because `uvcpp_web_app` has
-no QUIC API at all. It serves `/baseline2` and nothing else.
+8080 carries two protocols because `unary-grpc` names that port (`http://
+localhost:8080`) while the h1 profiles need it too. The two are told apart by
+the first 24 bytes of each connection: the RFC 9113 preface is byte-exact, so a
+connection that starts with it is h2c for the rest of its life and anything
+else is HTTP/1.1. That settles once per connection, and it is a decision rather
+than a guess. `baseline-h2c` and `json-h2c` do not need the split — they have
+the platform's dedicated h2c port (8082) to themselves.
 
-8080 does double duty. In the isolated profiles it is the HTTP/1.1 client
-listener above; in the three compose profiles (`gateway-64`, `gateway-h3`,
-`production-stack`) it is also the backend hop — the server runs with no
+The QUIC leg is the low-level `uvcpp_http_server`, because `uvcpp_web_app` has
+no QUIC API at all. It serves `/baseline2` as a route and the static tree
+through `uvcpp_static_server` mounted as the fallback handler;
+`uvcpp_http_server` has no `serve_static()` of its own, and on h3 a deferred
+reply is sent through the request's reply handle rather than a client pointer,
+so the fallback works without one.
+
+8080 also carries the compose hop. In the three compose profiles (`gateway-64`,
+`gateway-h3`, `production-stack`) it is the backend — the server runs with no
 certificates mounted, so this is the only port it opens, and the edge proxy owns
 8443.
 
@@ -65,6 +76,7 @@ certificates mounted, so this is the only port it opens, and the edge proxy owns
 | `/echo` | POST | Returns the request body back verbatim |
 | `/static/*` | GET | Files from the mounted `/data/static` |
 | `/ws` | WS | Echoes text and binary frames back on the same opcode |
+| `/benchmark.BenchmarkService/GetSum` | POST | gRPC unary, on 8080 over h2c and on 8443 over h2+TLS |
 | `/async-db` | GET | Postgres range query, `min`/`max`/`limit` |
 | `/public/baseline` | GET | The `a + b` query sum, anonymous side of the edge |
 | `/public/json/{count}` | GET | Same serializer as `/json/{count}` |
@@ -140,19 +152,27 @@ certificates mounted, so this is the only port it opens, and the edge proxy owns
 
 ### The h3 leg
 
-Two things about 8443/udp are worth stating, because they are deliberate:
+Three things about 8443/udp are worth stating, because they are deliberate:
 
 - **The handler splits the query string by hand.** The low-level
   `uvcpp_http_request` exposes only `url`, with no path or query accessor, so
   `?a=13&b=42` is parsed in the handler. The arithmetic is the same function the
   h2 leg calls, so the two cannot disagree. This is the entry's only hand-rolled
   parsing, and it exists because the high-level app has no QUIC support.
-- **`/static` is not served over h3.** libuvcpp has no h3-capable static
-  handler, which is why `static-h3` is not subscribed. The framework's web-layer
-  static server marks every response deferred, and the h3 dispatch path rejects
-  deferred responses with a 500 — there is no "send later" entry point on a QUIC
-  stream. Writing one for this entry would be a static handler written for the
-  benchmark, which the standard-mode rules exclude.
+- **`/static` is served by `uvcpp_static_server`, mounted as the fallback
+  handler** rather than through a route, because `uvcpp_http_server` has no
+  `serve_static()` of its own. That handler marks its responses *deferred* — it
+  answers from the libuv thread pool once the file has been read — so the h3
+  dispatch path has to accept a deferred reply instead of rejecting it with a
+  500. It does: the h3 handler is handed a reply handle it can send through
+  after it returns, which is what `send_h3_response` was already able to do per
+  stream. `set_spa_fallback(false)` matches the h1/h2 legs, so a miss is a 404
+  on all of them rather than `index.html` with a 200 here.
+- **The static tree is `uvcpp_static_server`, not `uvcpp_web_static`.** The
+  web-layer static server is reachable only through `uvcpp_web_app`, which has
+  no QUIC API at all, so the h3 leg cannot use it. Both revalidate against the
+  file's size and `mtime` per request, so a replaced file is served immediately
+  on either.
 
 ### The compose stacks
 
@@ -209,6 +229,7 @@ is the whole of it.
 
 ### Not subscribed
 
-`baseline-h2c` and `json-h2c` (libuvcpp has no cleartext h2), `static-h3` (see
-above), `fortunes` (libuvcpp has no HTML template engine), and `unary-grpc` /
-`unary-grpc-tls`.
+`fortunes`, and the remaining unrelated profiles. `fortunes` needs an HTML
+template engine, which libuvcpp does not have; rendering the table by hand in
+the entry would be exactly the "template engine written for the benchmark" the
+standard-mode rules exclude.
