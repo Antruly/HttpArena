@@ -6,6 +6,12 @@
 //   8080/tcp   cleartext HTTP/1.1        baseline, limited-conn, pipelined,
 //                                        async, json-comp, echo-ws, ws-pipeline,
 //                                        ws-limited, async-db, latency-*
+//                                        -- and the backend hop for the
+//                                        compose stacks: gateway-64 and
+//                                        gateway-h3 forward /baseline2,
+//                                        /json/{n} and /async-db here, and
+//                                        production-stack forwards /public/*
+//                                        and /api/* here
 //   8081/tcp   TLS, ALPN http/1.1        json-tls, 8gbit, static-tls
 //   8443/tcp   TLS, ALPN h2              baseline-h2, static-h2
 //   8443/udp   QUIC, ALPN h3             baseline-h3
@@ -38,13 +44,17 @@
 
 #include <unistd.h>
 
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -88,6 +98,114 @@ const char kAsyncDbSql[] =
 /// response the profile asks for when Postgres is unreachable or matches
 /// nothing, so there is one shape to produce rather than two.
 const char kAsyncDbEmpty[] = "{\"items\":[],\"count\":0}";
+
+// ---------------------------------------------------------------------------
+// production-stack -- cache-aside, in process
+// ---------------------------------------------------------------------------
+//
+// The production-stack profile requires cache-aside on `/api/items/{id}` and
+// `/api/me`: read the cache, fall through to Postgres on a miss, populate on
+// the way back, and invalidate on a write. *How* the cache is built is the
+// entry's choice -- the profile's implementation guide lists "in-process only:
+// no Redis for caching, just a local hashmap with TTL" next to the L1+L2 and
+// Redis-only options. This entry takes that one, and the reason is in the
+// deployment rather than in the benchmark: the profile runs exactly one server
+// process, so a shared L2 would add a network hop and a serialization step to
+// reads this process is already holding in memory. The compose stack still
+// ships the Redis the profile requires, and the server still waits for it to
+// report healthy, so a cache that cannot bind fails the stack instead of
+// leaving the run measured against something else.
+//
+// Why the map is process-global rather than one per worker loop: the two calls
+// that must see MISS then HIT are two separate connections, and a connection
+// is served by whichever loop owns it. A per-loop map would give each of those
+// calls its own empty cache, and the second would miss as well.
+
+/// Item entries live for one second and user entries for thirty. Both are the
+/// profile's own ceilings (implementation guide, "Cache TTLs"), and the short
+/// item TTL is deliberate there: IDs churn so Postgres keeps seeing traffic.
+const int kItemTtlMs = 1000;
+const int kUserTtlMs = 30000;
+
+/// Sharded so the common path takes a mutex on one bucket rather than on the
+/// whole cache -- at the connection counts this profile runs, a single lock
+/// over a map that everything reads and writes is a serialization point, not a
+/// formality.
+const size_t kCacheShards = 64;
+
+/// A hard ceiling on resident entries, so a long run over many distinct IDs
+/// cannot grow the map without bound. Expired entries are only reclaimed on
+/// lookup, and an item that is read once is never looked up again.
+const size_t kCacheMaxEntriesPerShard = 4096;
+
+struct cache_entry {
+  std::string body;
+  std::chrono::steady_clock::time_point expires;
+};
+
+struct cache_shard {
+  std::mutex mutex;
+  std::unordered_map<std::string, cache_entry> entries;
+};
+
+std::array<cache_shard, kCacheShards> g_cache;
+
+cache_shard& cache_shard_of(const std::string& key) {
+  return g_cache[std::hash<std::string>()(key) % kCacheShards];
+}
+
+/// The cached body for @p key, or false when it is absent or has expired.
+bool cache_lookup(const std::string& key, std::string* body) {
+  cache_shard& shard = cache_shard_of(key);
+  std::lock_guard<std::mutex> lock(shard.mutex);
+  std::unordered_map<std::string, cache_entry>::iterator it =
+      shard.entries.find(key);
+  if (it == shard.entries.end()) return false;
+  if (it->second.expires <= std::chrono::steady_clock::now()) {
+    shard.entries.erase(it);
+    return false;
+  }
+  *body = it->second.body;
+  return true;
+}
+
+void cache_store(const std::string& key, const std::string& body, int ttl_ms) {
+  cache_shard& shard = cache_shard_of(key);
+  cache_entry entry;
+  entry.body = body;
+  entry.expires =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl_ms);
+  std::lock_guard<std::mutex> lock(shard.mutex);
+  if (shard.entries.size() >= kCacheMaxEntriesPerShard) {
+    // Arbitrary rather than oldest-first: maintaining a recency order would
+    // cost more than the eviction is worth, and every entry here is already
+    // within a second of expiring on its own.
+    shard.entries.erase(shard.entries.begin());
+  }
+  shard.entries[key] = std::move(entry);
+}
+
+void cache_erase(const std::string& key) {
+  cache_shard& shard = cache_shard_of(key);
+  std::lock_guard<std::mutex> lock(shard.mutex);
+  shard.entries.erase(key);
+}
+
+std::string item_cache_key(long long id) {
+  return "item:" + std::to_string(id);
+}
+
+std::string user_cache_key(long long id) {
+  return "user:" + std::to_string(id);
+}
+
+/// The two statements behind the production-stack read paths. Both are single
+/// row lookups by primary key, so no index work is involved.
+const char kItemByIdSql[] =
+    "SELECT id, name, category, price, quantity, active, tags, "
+    "rating_score, rating_count FROM items WHERE id = $1";
+const char kUserByIdSql[] =
+    "SELECT id, name, email, plan FROM users WHERE id = $1";
 
 bool file_exists(const char* path) { return ::access(path, R_OK) == 0; }
 
@@ -401,6 +519,220 @@ void handle_async_db(uvcpp_web_app* app, uvcpp_web_request& req,
   }
 }
 
+// ---------------------------------------------------------------------------
+// production-stack -- /api/* (behind the edge's forward_auth)
+// ---------------------------------------------------------------------------
+//
+// The edge terminates TLS, verifies the JWT against the shared authsvc sidecar
+// and passes the verified user id down as `X-User-Id`. Nothing here parses a
+// token or looks at `Authorization` -- the profile's rules put JWT verification
+// at the edge and forbid the framework from doing it. What the server does do
+// is refuse a request that arrives without `X-User-Id`, so a misconfigured edge
+// that forwards `/api/*` straight through cannot silently serve private rows.
+
+/// A request that reached the framework without the edge's verified user id.
+/// 401 rather than a redirect: the profile's auth wall is checked as a status.
+void send_unauthorized(uvcpp_web_response& resp) {
+  resp.status(401).json_str("{\"error\":\"unauthorized\"}");
+  resp.end();
+}
+
+/// One `items` row as the profile's JSON, with `total` folded in. Same column
+/// names and the same nested `rating` object `/async-db` emits, so the two
+/// endpoints cannot drift apart -- and `total` is price x quantity, which is
+/// what the JSON profile checks its rows against.
+nlohmann::json item_row_json(const uvcpp_db_row& row) {
+  nlohmann::json item;
+  item["id"] = row["id"].to_int64();
+  item["name"] = row["name"].to_text();
+  item["category"] = row["category"].to_text();
+  item["price"] = row["price"].to_int64();
+  item["quantity"] = row["quantity"].to_int64();
+  item["active"] = row["active"].to_bool();
+  item["tags"] = parse_tags(row["tags"].to_text());
+  item["total"] = row["price"].to_int64() * row["quantity"].to_int64();
+  nlohmann::json rating;
+  rating["score"] = row["rating_score"].to_int64();
+  rating["count"] = row["rating_count"].to_int64();
+  item["rating"] = std::move(rating);
+  return item;
+}
+
+/// The body cached for `/api/items/{id}`, or the empty string when the row is
+/// not there. Only a real row is ever cached: caching the miss would answer a
+/// later read with a body the database no longer agrees with, and the profile's
+/// anti-cheat reads a row it just wrote.
+std::string item_body(uvcpp_db_status status, const uvcpp_db_table& table) {
+  if (!uvcpp_db_ok(status) || table.rows().empty()) return std::string();
+  return item_row_json(table.rows()[0]).dump();
+}
+
+/// The body cached for `/api/me`.
+std::string user_body(uvcpp_db_status status, const uvcpp_db_table& table) {
+  if (!uvcpp_db_ok(status) || table.rows().empty()) return std::string();
+  const uvcpp_db_row& row = table.rows()[0];
+  nlohmann::json user;
+  user["id"] = row["id"].to_int64();
+  user["name"] = row["name"].to_text();
+  user["email"] = row["email"].to_text();
+  user["plan"] = row["plan"].to_text();
+  return user.dump();
+}
+
+/// `X-Cache: HIT` / `MISS` on every `/api/items/{id}` read, including the ones
+/// that fall through to Postgres. The profile's cache-aside check reads exactly
+/// this header, twice in a row, and expects the pair to differ.
+void send_cached(uvcpp_web_response& resp, const std::string& body,
+                 bool hit) {
+  resp.set_header("X-Cache", hit ? "HIT" : "MISS");
+  resp.json_str(body);
+  resp.end();
+}
+
+/// `GET /api/items/{id}` -- cache-aside, L1 only, one-second TTL.
+void handle_api_item_get(uvcpp_web_app* app, uvcpp_web_request& req,
+                         uvcpp_web_response& resp, uvcpp_web_next next) {
+  if (req.header("X-User-Id").empty()) {
+    send_unauthorized(resp);
+    return;
+  }
+  const std::string* param = req.param("id");
+  const long long id = param != nullptr ? to_ll(*param) : 0;
+  const std::string key = item_cache_key(id);
+
+  std::string body;
+  if (cache_lookup(key, &body)) {
+    send_cached(resp, body, true);
+    return;
+  }
+  if (!g_db_ready) {
+    send_cached(resp, "{}", false);
+    return;
+  }
+
+  uvcpp_db_params params;
+  params.add(id);
+  uvcpp_web_response* rp = &resp;
+  const int rc = g_db.query(
+      app->loop(), kItemByIdSql, params,
+      [rp, next, key](uvcpp_db_status status, const uvcpp_db_table& table) {
+        const std::string json = item_body(status, table);
+        if (!json.empty()) cache_store(key, json, kItemTtlMs);
+        send_cached(*rp, json.empty() ? std::string("{}") : json, false);
+        next();
+      });
+  if (rc < 0) {
+    // Not dispatched, so no callback is coming. `next` was never copied and
+    // the chain is not left suspended.
+    send_cached(resp, "{}", false);
+  }
+}
+
+/// `POST /api/items/{id}` -- update the row, then drop it from the cache.
+///
+/// The invalidation is unconditional and happens before the reply: the
+/// profile's check warms an id, writes it, and expects the next read to be a
+/// MISS. Dropping the key only when the UPDATE reports a row would leave the
+/// stale copy in place for an id that does not exist yet -- the profile's write
+/// set is IDs the reads also touch, but nothing promises the row is there.
+void handle_api_item_post(uvcpp_web_app* app, uvcpp_web_request& req,
+                          uvcpp_web_response& resp, uvcpp_web_next next) {
+  if (req.header("X-User-Id").empty()) {
+    send_unauthorized(resp);
+    return;
+  }
+  const std::string* param = req.param("id");
+  const long long id = param != nullptr ? to_ll(*param) : 0;
+
+  // The body is the profile's `{"name":..,"price":..,"quantity":..}`. A body
+  // that will not parse is not an error worth inventing a status for: the
+  // write simply goes through with the values that are there, defaulting to
+  // what the row already had is not possible without a read, so name keeps the
+  // empty string and the numbers keep zero.
+  std::string name;
+  long long price = 0;
+  long long quantity = 0;
+  try {
+    const nlohmann::json body = nlohmann::json::parse(req.body_str());
+    name = body.value("name", std::string());
+    price = body.value("price", 0LL);
+    quantity = body.value("quantity", 0LL);
+  } catch (const std::exception&) {
+    // defaults above
+  }
+
+  if (!g_db_ready) {
+    resp.status(204);
+    resp.end();
+    return;
+  }
+
+  uvcpp_db_params params;
+  params.add(name).add(price).add(quantity).add(id);
+  uvcpp_web_response* rp = &resp;
+  const std::string key = item_cache_key(id);
+  const int rc = g_db.query(
+      app->loop(),
+      "UPDATE items SET name = $1, price = $2, quantity = $3 WHERE id = $4",
+      params,
+      [rp, next, key](uvcpp_db_status, const uvcpp_db_table&) {
+        cache_erase(key);
+        rp->status(204);
+        rp->end();
+        next();
+      });
+  if (rc < 0) {
+    cache_erase(key);
+    resp.status(204);
+    resp.end();
+  }
+}
+
+/// `GET /api/me` -- the user the edge authenticated, cache-aside at 30s.
+void handle_api_me(uvcpp_web_app* app, uvcpp_web_request& req,
+                   uvcpp_web_response& resp, uvcpp_web_next next) {
+  const std::string uid = req.header("X-User-Id");
+  if (uid.empty()) {
+    send_unauthorized(resp);
+    return;
+  }
+  const long long id = to_ll(uid);
+  const std::string key = user_cache_key(id);
+
+  std::string body;
+  if (cache_lookup(key, &body)) {
+    resp.set_header("X-Cache", "HIT");
+    resp.json_str(body);
+    resp.end();
+    return;
+  }
+  if (!g_db_ready) {
+    resp.status(503).json_str("{}");
+    resp.end();
+    return;
+  }
+
+  uvcpp_db_params params;
+  params.add(id);
+  uvcpp_web_response* rp = &resp;
+  const int rc = g_db.query(
+      app->loop(), kUserByIdSql, params,
+      [rp, next, key](uvcpp_db_status status, const uvcpp_db_table& table) {
+        const std::string json = user_body(status, table);
+        if (!json.empty()) cache_store(key, json, kUserTtlMs);
+        rp->json_str(json.empty() ? std::string("{}") : json);
+        rp->end();
+        next();
+      });
+  if (rc < 0) {
+    // Unlike `/api/items`, there is no cache header to get right here and no
+    // documented empty shape -- an unavailable database is a 503, not a body
+    // that claims a user.
+    resp.status(503).json_str("{}");
+    resp.end();
+  }
+}
+
 void handle_echo(uvcpp_web_request& req, uvcpp_web_response& resp,
                  uvcpp_web_next) {
   // req.body_str() is the decoded body -- chunked framing is already gone, so
@@ -544,6 +876,42 @@ int main() {
     handle_async_db(&h1, req, resp, next);
   });
   h1.websocket("/ws", handle_ws);
+
+  // ---------------------------------------------------------------------
+  // The routes the compose-orchestrated profiles reach over their own hop
+  // ---------------------------------------------------------------------
+  //
+  // gateway-64 / gateway-h3 put a stock Caddy in front and let it serve
+  // /static/* off disk; everything else it forwards over plain HTTP/1.1 to
+  // 127.0.0.1:8080, which is this listener. So the three dynamic endpoints the
+  // gateway URI mix names -- /baseline2, /json/{n}, /async-db -- all have to
+  // answer on h1, not only on the 8443 listener the isolated profiles use.
+  h1.get("/baseline2", handle_baseline2);
+
+  // ---------------------------------------------------------------------
+  // production-stack -- /public/* unauthenticated, /api/* behind the edge
+  // ---------------------------------------------------------------------
+  //
+  // /public/baseline is the same query-sum /baseline2 answers, and
+  // /public/json/{n} is the same serializer /json/{n} uses; the profile simply
+  // spells the two paths differently because they sit on the anonymous side of
+  // the edge's split.
+  h1.get("/public/baseline", handle_baseline2);
+  h1.get("/public/json/:count", handle_json);
+  h1.get("/api/items/:id", [&h1](uvcpp_web_request& req,
+                                 uvcpp_web_response& resp,
+                                 uvcpp_web_next next) {
+    handle_api_item_get(&h1, req, resp, next);
+  });
+  h1.post("/api/items/:id", [&h1](uvcpp_web_request& req,
+                                  uvcpp_web_response& resp,
+                                  uvcpp_web_next next) {
+    handle_api_item_post(&h1, req, resp, next);
+  });
+  h1.get("/api/me", [&h1](uvcpp_web_request& req, uvcpp_web_response& resp,
+                          uvcpp_web_next next) {
+    handle_api_me(&h1, req, resp, next);
+  });
 
   // Every route is registered above, before start(): with set_loops(n > 1)
   // registering afterwards races on the process-shared chain cache.

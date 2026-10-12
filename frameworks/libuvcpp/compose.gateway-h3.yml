@@ -1,0 +1,51 @@
+# gateway-h3 — the same two-service stack as compose.gateway.yml, exercised
+# over HTTP/3 at the edge.
+#
+# Nothing about the stack changes: stock Caddy binds 8443 on both tcp and udp
+# from the same `protocols h1 h2 h3` server block, so the proxy config is
+# byte-identical and only the load generator differs (h2load with
+# `--alpn-list=h3`). The upstream hop stays plain h1 over loopback, which is
+# what the server speaks.
+#
+# Kept as a separate file rather than a symlink because the harness resolves
+# compose files by name (`compose.<profile>.yml`, with gateway-64 on the legacy
+# `compose.gateway.yml`), and because a real h3-only deployment would put a
+# UDP-capable edge somewhere other than in front of the same backend.
+services:
+  proxy:
+    build:
+      context: ./proxy
+    network_mode: host
+    cpuset: "${PROXY_CPUSET:-0-15,64-79}"
+    ulimits:
+      memlock: -1
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ${CERTS_DIR}:/certs:ro
+      - ${DATA_DIR}/static:/data/static:ro
+    depends_on:
+      - server
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    network_mode: host
+    cpuset: "${SERVER_CPUSET:-16-31,80-95}"
+    ulimits:
+      memlock: -1
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_MAX_CONN=256
+      - DATASET_PATH=/data/dataset.json
+    volumes:
+      - ${DATA_DIR}/dataset.json:/data/dataset.json:ro

@@ -46,13 +46,19 @@ it cannot answer h2.
 The QUIC leg is the low-level `uvcpp_http_server`, because `uvcpp_web_app` has
 no QUIC API at all. It serves `/baseline2` and nothing else.
 
+8080 does double duty. In the isolated profiles it is the HTTP/1.1 client
+listener above; in the three compose profiles (`gateway-64`, `gateway-h3`,
+`production-stack`) it is also the backend hop — the server runs with no
+certificates mounted, so this is the only port it opens, and the edge proxy owns
+8443.
+
 ## Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/baseline11` | GET | Sums query parameter values |
 | `/baseline11` | POST | Sums query parameters + request body |
-| `/baseline2` | GET | Same, on 8443 over h2 and h3 |
+| `/baseline2` | GET | Same, on 8443 over h2 and h3, and on 8080 for the gateway hop |
 | `/pipeline` | GET | Returns `ok` (plain text) |
 | `/delay/{ms}` | GET | Answers after `ms`, with the parameter echoed verbatim |
 | `/json/{count}?m=N` | GET | First `count` dataset items with `total = price * quantity * m` |
@@ -60,6 +66,11 @@ no QUIC API at all. It serves `/baseline2` and nothing else.
 | `/static/*` | GET | Files from the mounted `/data/static` |
 | `/ws` | WS | Echoes text and binary frames back on the same opcode |
 | `/async-db` | GET | Postgres range query, `min`/`max`/`limit` |
+| `/public/baseline` | GET | The `a + b` query sum, anonymous side of the edge |
+| `/public/json/{count}` | GET | Same serializer as `/json/{count}` |
+| `/api/items/{id}` | GET | Cache-aside read, `X-Cache: MISS`/`HIT`, needs `X-User-Id` |
+| `/api/items/{id}` | POST | `UPDATE` then cache invalidation, `204`, needs `X-User-Id` |
+| `/api/me` | GET | The authenticated user, cache-aside at 30 s, needs `X-User-Id` |
 
 ## Notes
 
@@ -143,8 +154,61 @@ Two things about 8443/udp are worth stating, because they are deliberate:
   stream. Writing one for this entry would be a static handler written for the
   benchmark, which the standard-mode rules exclude.
 
+### The compose stacks
+
+`gateway-64`, `gateway-h3` and `production-stack` are orchestrated by
+`compose.<profile>.yml`, all of which run `network_mode: host` and put a stock
+unmodified `caddy:2-alpine` at the edge. There is no hand-written proxy in this
+entry: the gateway profiles' rules exclude one ("No custom proxy
+implementations"), and a Caddyfile that says `file_server` and `reverse_proxy`
+is the whole of it.
+
+| Profile | Compose file | Services |
+|---|---|---|
+| `gateway-64` | `compose.gateway.yml` | proxy + server |
+| `gateway-h3` | `compose.gateway-h3.yml` | proxy + server |
+| `production-stack` | `compose.production-stack.yml` | edge + cache + authsvc + server |
+
+- **The edge serves `/static/*` off the mounted disk itself**, with
+  `file_server { precompressed br gzip }` — never forwarded to the backend. That
+  is what the gateway rules require and what the profile measures: a front door
+  doing TLS, compression and file I/O in front of an application server that
+  answers only the dynamic endpoints.
+- **The backend hop is plain HTTP/1.1 over loopback**, not h2 and not a Unix
+  socket. Many independent h2 streams arriving from the client fan out across
+  the server's per-core loops through a pool of h1 keepalive connections; a
+  single h2 connection to the backend would re-serialize them behind one
+  connection's flow control.
+- **The same Caddyfile covers gateway-64 and gateway-h3.** `protocols h1 h2 h3`
+  binds 8443 on tcp and udp from one server block; only the load generator
+  differs (`h2load --alpn-list=h3`).
+- **The server is not given `/certs`.** `main.cc` opens its 8081 and 8443
+  listeners only when the certificate pair is readable, so with none mounted it
+  comes up on 8080 alone and leaves every TLS port to the edge. Mount the
+  certificates into both services and the two race for 8443.
+- **`production-stack`'s JWT verification is the shared sidecar, unmodified** —
+  `frameworks/_shared/authsvc/`, built from the same directory every entry uses.
+  The edge fires `forward_auth` at it for every `/api/*` request and copies back
+  the `X-User-Id` it resolves; the token cost is not cached, because that cost is
+  part of what the profile measures. The server never parses a token, never reads
+  `Authorization`, and separately returns 401 for any `/api/*` request that
+  arrives with no `X-User-Id` at all.
+- **Cache-aside is in-process.** The profile's implementation guide lists
+  "in-process only: no Redis for caching, just a local hashmap with TTL" beside
+  the L1+L2 and Redis-only options, and this entry takes it: the profile runs one
+  server process, so a shared L2 would add a network hop and a serialization step
+  to reads already held in memory. Item entries live one second and user entries
+  thirty, both the profile's own ceilings, and a `POST /api/items/{id}` drops the
+  key before answering `204`. The `cache` service the profile requires is still
+  in the compose file and the server still waits for it to report healthy — that
+  is the rule, and it is also what makes a cache that cannot bind fail the stack
+  instead of leaving the run measured against something else.
+- **The invalidated key is dropped unconditionally**, whether or not the `UPDATE`
+  reported a row, so a write to an id the reads have cached cannot leave a stale
+  copy behind.
+
 ### Not subscribed
 
 `baseline-h2c` and `json-h2c` (libuvcpp has no cleartext h2), `static-h3` (see
-above), `fortunes` (libuvcpp has no HTML template engine), `unary-grpc` (no
-gRPC), and the gateway / production-stack compose profiles.
+above), `fortunes` (libuvcpp has no HTML template engine), and `unary-grpc` /
+`unary-grpc-tls`.

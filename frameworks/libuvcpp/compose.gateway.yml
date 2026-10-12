@@ -1,0 +1,54 @@
+# gateway-64 — stock Caddy (TLS + h2 on 8443) in front of the libuvcpp server.
+#
+# Two services, which is what the profile fixes: `proxy` terminates TLS, serves
+# /static/* off disk and forwards the dynamic endpoints over plain h1 to
+# 127.0.0.1:8080; `server` answers /baseline2, /json/{n} and /async-db and
+# nothing else.
+#
+# The server is deliberately **not** given /certs. main.cc opens its 8081 and
+# 8443 listeners only when the certificate pair is readable, so with no certs
+# mounted it comes up on 8080 alone and leaves every TLS port to the proxy.
+# Mount them into both and the two would race for 8443.
+#
+# Both services run on host networking, so the proxy's upstream hop is loopback
+# rather than a bridge. The cpuset defaults below mirror the reference entry's
+# split; PROXY_CPUSET / SERVER_CPUSET are the two knobs worth sweeping, and
+# terminating TLS under multiplexed h2 is usually the expensive half.
+services:
+  proxy:
+    build:
+      context: ./proxy
+    network_mode: host
+    cpuset: "${PROXY_CPUSET:-0-15,64-79}"
+    ulimits:
+      memlock: -1
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ${CERTS_DIR}:/certs:ro
+      - ${DATA_DIR}/static:/data/static:ro
+    depends_on:
+      - server
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    network_mode: host
+    cpuset: "${SERVER_CPUSET:-16-31,80-95}"
+    ulimits:
+      memlock: -1
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - DATABASE_MAX_CONN=256
+      - DATASET_PATH=/data/dataset.json
+    volumes:
+      - ${DATA_DIR}/dataset.json:/data/dataset.json:ro
