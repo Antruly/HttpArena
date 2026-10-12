@@ -1153,7 +1153,7 @@
   },
   "libuvcpp": {
     "dir": "libuvcpp",
-    "description": "libuvcpp on the libuv event loop, one loop per available core. Routing, path and query params, static files and WebSocket through uvcpp_web_app, nlohmann/json serialization behind uvcpp_json, and gzip through the built-in response compression. HTTP/2 over TLS on 8443 and HTTP/3 on 8443/udp are the same package.",
+    "description": "libuvcpp on the libuv event loop, one loop per available core. Routing, path and query params, static files and WebSocket through uvcpp_web_app, nlohmann/json serialization behind uvcpp_json, gzip through the built-in response compression, and async Postgres through uvcpp_db_pool. HTTP/2 over TLS on 8443 and HTTP/3 on 8443/udp are the same build.",
     "repo": "https://github.com/Antruly/libuvcpp",
     "type": "emerging",
     "engine": "libuv",
