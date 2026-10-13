@@ -143,6 +143,21 @@ the profile forbids the framework from doing the JWT verification itself.
   the whole payload dumped, still in `main.cc` as `build_json_general`, the
   fallback for any value the writer cannot reproduce byte-for-byte — the whole
   path costs 3.0x less CPU per request (176.0 -> 59.2 us).
+  The dataset is now read out of the DOM once at startup into a flat array
+  (`flat_item` plus a single character pool, ~5 KB for all 50 items), so the
+  handler walks that instead of 50 `std::map` trees; the walk it replaces cost
+  about 140 ns per item. That takes the serialization step for `/json/50?m=6`
+  from 31.0 to 23.4 us (9 interleaved rounds in one process, median of the
+  per-round ratios 0.751 / 0.769 / 0.793 over three repeats) and 10.8-11.7% of
+  server CPU per request end to end (11 paired rounds: 0.883 and 0.893 in two
+  runs). Nothing is pre-rendered — every request still walks the live items and
+  writes their bytes. The flattening is not trusted on faith:
+  `build_flat_dataset` writes each item both ways and enables the fast path only
+  if every one matches the reference byte for byte at three multipliers, so a
+  dataset of any other shape stays on the reference path and says which path it
+  is on at startup. Parsing is now the framework's `uvcpp_json_parse` rather
+  than nlohmann's `parse` directly, so every JSON call the entry makes is one
+  the library publishes.
 - **Compression is the framework's built-in response compression** (gzip), which
   answers `Accept-Encoding` per request and adds no `Content-Encoding` when the
   client sends none. The library has no brotli compressor, so an `Accept-Encoding:

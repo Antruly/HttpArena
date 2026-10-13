@@ -199,7 +199,7 @@ uvcpp_web_static_options kStaticOpts = [] {
 
 /// The 50-item dataset, read once at startup. Read-only afterwards, so every
 /// worker loop can share it without a lock.
-nlohmann::json g_dataset;
+uvcpp_json g_dataset;
 
 /// The Postgres pool behind `/async-db`. One pool for the process, not one per
 /// worker loop: the pool is the thing that owns the connections, and
@@ -378,17 +378,24 @@ void load_dataset() {
   }
   const std::string text((std::istreambuf_iterator<char>(in)),
                          std::istreambuf_iterator<char>());
-  try {
-    nlohmann::json parsed = nlohmann::json::parse(text);
-    if (parsed.is_array()) {
-      g_dataset = parsed;
-    } else {
-      std::fprintf(stderr, "libuvcpp: `%s` is not a JSON array\n", path.c_str());
-    }
-  } catch (const std::exception& e) {
+  // Through the framework's own documented parser rather than nlohmann's
+  // directly: same backend, but the entry then touches no JSON API the library
+  // does not publish. `uvcpp_json_parse` reports a `json_status` instead of
+  // throwing, and it applies the depth and size limits `nlohmann::json::parse`
+  // leaves to the caller. The 12 KB dataset is three orders of magnitude under
+  // its 8 MiB default.
+  uvcpp_json parsed;
+  const json_status st = uvcpp_json_parse(text, parsed);
+  if (st != json_status::OK) {
     std::fprintf(stderr, "libuvcpp: cannot parse `%s`: %s\n", path.c_str(),
-                 e.what());
+                 json_status_name(st));
+    return;
   }
+  if (!parsed.is_array()) {
+    std::fprintf(stderr, "libuvcpp: `%s` is not a JSON array\n", path.c_str());
+    return;
+  }
+  g_dataset = std::move(parsed);
 }
 
 /// Leading decimal digits, 0 when there are none. Same reading of a query
@@ -511,6 +518,250 @@ bool put_json_value(const nlohmann::json& v, uvcpp_json_writer& w) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The flattened dataset
+// ---------------------------------------------------------------------------
+
+/// A slice of `g_flat_pool`.
+struct flat_str {
+  std::uint32_t off;
+  std::uint32_t len;
+};
+
+/// One dataset item, read out of the DOM once at startup. Every field is a
+/// scalar or an offset into `g_flat_pool`, so all 50 items are one contiguous
+/// block of a few KB: serializing a response walks that array instead of 50
+/// `std::map` trees (eight individually-allocated nodes each, plus two more
+/// lookups for `price`/`quantity`).
+struct flat_item {
+  long long id;
+  long long price;
+  long long quantity;
+  long long rating_count;
+  long long rating_score;
+  bool active;
+  flat_str name;
+  flat_str category;
+  std::uint32_t tag_first;  // index into g_flat_tags
+  std::uint32_t tag_n;
+};
+
+std::vector<char> g_flat_pool;      // every string, one block; frozen after startup
+std::vector<flat_str> g_flat_tags;  // every item's tags, flattened
+std::vector<flat_item> g_flat;      // the items themselves
+
+/// False until build_flat_dataset() has built the flat form **and** proved it
+/// reproduces the reference path byte for byte. `build_json` declines to the
+/// slower paths while this is false, so a dataset of any other shape is still
+/// answered correctly -- just at the reference path's cost.
+bool g_flat_ok = false;
+
+/// Appends `s` to the pool and returns its slice.
+flat_str flat_push(const std::string& s) {
+  flat_str r;
+  r.off = static_cast<std::uint32_t>(g_flat_pool.size());
+  r.len = static_cast<std::uint32_t>(s.size());
+  g_flat_pool.insert(g_flat_pool.end(), s.begin(), s.end());
+  return r;
+}
+
+/// An integer, or false. A float counts as "not an integer" on purpose: the
+/// writer renders doubles with a different algorithm than `dump()` does, so
+/// those items have to keep going through the reference path.
+bool flat_int(const nlohmann::json& v, long long* out) {
+  if (v.is_number_unsigned()) {
+    const unsigned long long u = v.get<unsigned long long>();
+    // Past `LLONG_MAX` the writer and `dump()` disagree on the digits, and
+    // truncating would be a lie either way -- decline.
+    if (u > static_cast<unsigned long long>(9223372036854775807LL)) return false;
+    *out = static_cast<long long>(u);
+    return true;
+  }
+  if (!v.is_number_integer()) return false;
+  *out = v.get<long long>();
+  return true;
+}
+
+/// A string, or false. Borrows from the DOM, which is not written before
+/// startup ends; the callers copy into the pool immediately.
+bool flat_str_of(const nlohmann::json& v, const std::string** out) {
+  if (!v.is_string()) return false;
+  *out = &v.get_ref<const std::string&>();
+  return true;
+}
+
+/// The keys below are compile-time literals and their order is the one
+/// nlohmann's default `std::map` object sorts them into -- which is what
+/// `dump()` and the reference path emit.
+template <std::size_t N>
+bool flat_key(uvcpp_json_writer& w, const char (&k)[N]) {
+  return w.key(k, N - 1) == json_write_status::OK;
+}
+
+/// Writes one flattened item. `total` is separate because it depends on the
+/// request's `m`.
+bool flat_write_item(const flat_item& it, long long total,
+                     uvcpp_json_writer& w) {
+  const char* pool = g_flat_pool.data();
+  if (!flat_key(w, "active")) return false;
+  if (w.value(it.active) != json_write_status::OK) return false;
+  if (!flat_key(w, "category")) return false;
+  if (w.value(pool + it.category.off, it.category.len) != json_write_status::OK)
+    return false;
+  if (!flat_key(w, "id")) return false;
+  if (w.value(it.id) != json_write_status::OK) return false;
+  if (!flat_key(w, "name")) return false;
+  if (w.value(pool + it.name.off, it.name.len) != json_write_status::OK)
+    return false;
+  if (!flat_key(w, "price")) return false;
+  if (w.value(it.price) != json_write_status::OK) return false;
+  if (!flat_key(w, "quantity")) return false;
+  if (w.value(it.quantity) != json_write_status::OK) return false;
+  if (!flat_key(w, "rating")) return false;
+  if (w.object_begin() != json_write_status::OK) return false;
+  if (!flat_key(w, "count")) return false;
+  if (w.value(it.rating_count) != json_write_status::OK) return false;
+  if (!flat_key(w, "score")) return false;
+  if (w.value(it.rating_score) != json_write_status::OK) return false;
+  if (w.object_end() != json_write_status::OK) return false;
+  if (!flat_key(w, "tags")) return false;
+  if (w.array_begin() != json_write_status::OK) return false;
+  for (std::uint32_t t = 0; t < it.tag_n; ++t) {
+    const flat_str& s = g_flat_tags[it.tag_first + t];
+    if (w.value(pool + s.off, s.len) != json_write_status::OK) return false;
+  }
+  if (w.array_end() != json_write_status::OK) return false;
+  if (!flat_key(w, "total")) return false;
+  return w.value(total) == json_write_status::OK;
+}
+
+/// Reads the DOM into the flat form and **proves** the flat form reproduces the
+/// reference path before the fast path is allowed on. The proof is the point:
+/// `flat_write_item` hard-codes this dataset's key order and field types, so a
+/// dataset that differs in any way -- an extra key, a float, a missing
+/// `rating` -- has to fall back rather than answer with different bytes.
+void build_flat_dataset() {
+  g_flat_ok = false;
+  g_flat.clear();
+  g_flat_tags.clear();
+  g_flat_pool.clear();
+  if (!g_dataset.is_array()) return;
+
+  for (std::size_t i = 0; i < g_dataset.size(); ++i) {
+    const nlohmann::json& item = g_dataset[i];
+    if (!item.is_object()) return;
+
+    flat_item f;
+    {
+      auto it = item.find("id");
+      if (it == item.end() || !flat_int(*it, &f.id)) return;
+    }
+    {
+      auto it = item.find("price");
+      if (it == item.end() || !flat_int(*it, &f.price)) return;
+    }
+    {
+      auto it = item.find("quantity");
+      if (it == item.end() || !flat_int(*it, &f.quantity)) return;
+    }
+    {
+      auto it = item.find("active");
+      if (it == item.end() || !it->is_boolean()) return;
+      f.active = it->get<bool>();
+    }
+    {
+      const std::string* s = nullptr;
+      auto it = item.find("name");
+      if (it == item.end() || !flat_str_of(*it, &s)) return;
+      f.name = flat_push(*s);
+    }
+    {
+      const std::string* s = nullptr;
+      auto it = item.find("category");
+      if (it == item.end() || !flat_str_of(*it, &s)) return;
+      f.category = flat_push(*s);
+    }
+    {
+      auto it = item.find("rating");
+      if (it == item.end() || !it->is_object()) return;
+      auto c = it->find("count");
+      auto s = it->find("score");
+      if (c == it->end() || s == it->end()) return;
+      if (!flat_int(*c, &f.rating_count)) return;
+      if (!flat_int(*s, &f.rating_score)) return;
+    }
+    {
+      auto it = item.find("tags");
+      if (it == item.end() || !it->is_array()) return;
+      const std::uint32_t first = static_cast<std::uint32_t>(g_flat_tags.size());
+      for (auto e = it->begin(); e != it->end(); ++e) {
+        const std::string* s = nullptr;
+        if (!flat_str_of(*e, &s)) return;
+        g_flat_tags.push_back(flat_push(*s));
+      }
+      f.tag_first = first;
+      f.tag_n = static_cast<std::uint32_t>(g_flat_tags.size()) - first;
+    }
+    g_flat.push_back(f);
+  }
+
+  // Self-check: every item, written the flat way, has to come out byte for byte
+  // the same as writing it the reference way. Three multipliers, so a `total`
+  // that only lines up for one of them is caught too.
+  static const long long kCheckM[] = {1LL, 7LL, 1000003LL};
+  for (std::size_t i = 0; i < g_flat.size(); ++i) {
+    for (std::size_t k = 0; k < sizeof(kCheckM) / sizeof(kCheckM[0]); ++k) {
+      const long long m = kCheckM[k];
+      std::string got;
+      uvcpp_json_writer w(got);
+      if (w.object_begin() != json_write_status::OK) return;
+      const flat_item& fi = g_flat[i];
+      if (!flat_write_item(fi, fi.price * fi.quantity * m, w)) return;
+      if (w.object_end() != json_write_status::OK) return;
+      if (w.finish() != json_write_status::OK) return;
+
+      nlohmann::json ref = g_dataset[i];
+      ref["total"] = g_flat[i].price * g_flat[i].quantity * m;
+      if (ref.dump() != got) {
+        std::fprintf(stderr,
+                     "libuvcpp: dataset item %zu does not reproduce the "
+                     "reference bytes -- /json stays on the reference path\n",
+                     i);
+        g_flat_ok = false;
+        return;
+      }
+    }
+  }
+  g_flat_ok = true;
+}
+
+/// The fast path itself: the same bytes the writer path produces, out of the
+/// flat array. Declines to `build_json_general`, not to the writer path, if
+/// anything goes wrong -- the writer path's own declines are all decided before
+/// this point, and re-entering it would only re-walk the trees.
+std::string build_json_flat(int n, long long m) {
+  std::string out;
+  out.reserve(static_cast<size_t>(n) * 224u + 64u);
+  uvcpp_json_writer w(out);
+  if (w.object_begin() != json_write_status::OK) return build_json_general(n, m);
+  if (!flat_key(w, "items")) return build_json_general(n, m);
+  if (w.array_begin() != json_write_status::OK) return build_json_general(n, m);
+  for (int i = 0; i < n; ++i) {
+    const flat_item& it = g_flat[static_cast<size_t>(i)];
+    if (w.object_begin() != json_write_status::OK) return build_json_general(n, m);
+    if (!flat_write_item(it, it.price * it.quantity * m, w))
+      return build_json_general(n, m);
+    if (w.object_end() != json_write_status::OK) return build_json_general(n, m);
+  }
+  if (w.array_end() != json_write_status::OK) return build_json_general(n, m);
+  if (!flat_key(w, "count")) return build_json_general(n, m);
+  if (w.value(static_cast<long long>(n)) != json_write_status::OK)
+    return build_json_general(n, m);
+  if (w.object_end() != json_write_status::OK) return build_json_general(n, m);
+  if (w.finish() != json_write_status::OK) return build_json_general(n, m);
+  return out;
+}
+
 /// `{"items": [...], "count": N}` for the first `count` dataset items, each
 /// carrying `total = price * quantity * m`.
 ///
@@ -535,6 +786,7 @@ std::string build_json(int count, long long m) {
   int n = count;
   if (n < 0) n = 0;
   if (n > available) n = available;
+  if (g_flat_ok) return build_json_flat(n, m);
 
   std::string out;
   // Pure capacity hint: the largest item in this dataset serializes to 172
@@ -1210,6 +1462,20 @@ int main() {
     std::fprintf(stderr, "libuvcpp: dataset is empty -- /json will answer "
                          "with an empty item list\n");
   }
+
+  // Reads the dataset into the flat array and self-checks it against the
+  // reference path; a dataset it cannot reproduce leaves `/json` on the
+  // reference path (see build_flat_dataset). Which of the two it ended up on
+  // is printed, because "the two arms answered the same bytes" is worth
+  // nothing on its own -- it is also what a fast path that never ran looks
+  // like.
+  build_flat_dataset();
+  std::fprintf(stderr,
+               "libuvcpp: /json fast path: %s (%zu items, %zu tag strings, "
+               "%zu B pool + %zu B items)\n",
+               g_flat_ok ? "flattened dataset" : "reference DOM path",
+               g_flat.size(), g_flat_tags.size(), g_flat_pool.size(),
+               g_flat.size() * sizeof(flat_item));
 
   // The one connection pool for the process, opened before any listener so a
   // bad DATABASE_URL is reported at startup rather than on the first request.
