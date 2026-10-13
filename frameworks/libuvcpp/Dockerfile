@@ -117,8 +117,20 @@ ENV DEBIAN_FRONTEND=noninteractive
 # and these profiles run `-m 32` and `-m 100`, where the two arms overlap.
 # `perf(web): 压缩不再每请求新建一个 deflate 内核` (+2.4% on json-comp,
 # non-overlapping over 5 alternating rounds each way) is folded in as well.
+#
+# The pin moves past `fix(web): ws 发送队列整批合并` (219b0da), which is the one
+# change here that a previous round already measured the absence of. Turning
+# TCP_NODELAY on by default removed the incidental Nagle coalescing that had been
+# batching the WebSocket echo replies, and `echo-ws-pipeline` fell from
+# 10.85M / 12.63M / 10.63M req/s (512 / 4096 / 16384) to
+# 4.30M / 3.94M / 3.81M -- while the single-depth `echo-ws` cases did not move
+# at all, which is what pointed at the send path rather than the frame path.
+# The fix batches a read-dispatch's whole send queue into one `uv_write`; the
+# criterion is segments per frame on a 1500-byte veth (1.0000 -> 0.0625) and,
+# end to end, 524k-859k frames/s -> 4,111k-5,215k, with a v1.6.1 control arm at
+# 0.71 segments/frame and 1,014k frames/s.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
-ARG LIBUVCPP_REF=2d5fe7406fc2ab6c72a7f949ef0f133e3d86bfd2
+ARG LIBUVCPP_REF=219b0da63ce56bb196e2140f972d83136e148bd1
 
 ARG OPENSSL_VERSION=3.5.0
 
