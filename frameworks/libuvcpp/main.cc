@@ -58,6 +58,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -67,6 +68,7 @@
 #include <iterator>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -148,7 +150,27 @@ nlohmann::json g_dataset;
 /// inside). A pool per loop would open `loops x max` connections and hit the
 /// server's connection ceiling for nothing.
 uvcpp_db_pool g_db;
-bool g_db_ready = false;
+
+/// Whether `g_db` is open. Read on every loop thread (each database route asks
+/// before it borrows a connection), written by the startup attempt and, if that
+/// one lost the race described in init_database(), by the retry thread -- hence
+/// atomic rather than a plain bool. The pool itself is safe to call from any
+/// thread (`db/uvcpp_db_pool.h:96`); this flag is what keeps a query from being
+/// attempted against a pool that is not open.
+std::atomic<bool> g_db_ready(false);
+
+/// The retry ramp behind that race: fast while the window is the one
+/// init_database() describes (a second or two of initdb temporaries), slow once
+/// the database is not *late* but absent, and never past the budget. Sliced so
+/// `stop_db_retry()` does not have to wait out a nap.
+const int kDbRetryFirstMs = 250;
+const int kDbRetrySlowAfter = 40;  // ~10 s of fast attempts
+const int kDbRetrySlowMs = 2000;
+const int kDbRetrySliceMs = 25;
+const int kDbRetryBudgetMs = 120000;
+
+std::atomic<bool> g_db_retry_stop(false);
+std::thread g_db_retry_thread;
 
 /// What `uvcpp_db_table` cannot know: an unrecognised Postgres OID arrives as
 /// its text form, which is exactly right for every column here except `tags` --
@@ -504,6 +526,53 @@ std::string build_async_db_json(uvcpp_db_status status,
   return payload.dump();
 }
 
+/// The retry half of init_database(): keep trying to open the pool, and give up
+/// for good once the budget is spent, so a database that is simply not there
+/// does not leave a thread working for the life of the run.
+///
+/// The ramp is the shape of the problem. The race this exists for lasts about a
+/// second, so the first attempts are close together; past `kDbRetrySlowAfter`
+/// the database is not late but broken, and widening the interval just keeps
+/// the failures cheap. Either way the cost is one blocked `connect()` on *this*
+/// thread per attempt -- the loop threads never wait for it.
+void retry_database(std::string url, size_t max_conn) {
+  int waited_ms = 0;
+  int attempts = 0;
+  while (!g_db_retry_stop.load()) {
+    const int nap =
+        attempts < kDbRetrySlowAfter ? kDbRetryFirstMs : kDbRetrySlowMs;
+    for (int slept = 0; slept < nap && !g_db_retry_stop.load();
+         slept += kDbRetrySliceMs) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(kDbRetrySliceMs));
+    }
+    if (g_db_retry_stop.load()) break;
+    waited_ms += nap;
+    ++attempts;
+
+    // `init()` after a failed `init()` is the documented way back: it closes
+    // what it had first, and a failure leaves the pool empty rather than
+    // half-open (`db/uvcpp_db_pool.h:103`). So each attempt below is the same
+    // call the startup path makes, made again.
+    if (uvcpp_db_ok(g_db.init(url, 1, max_conn))) {
+      g_db_ready.store(true);
+      std::fprintf(stderr,
+                   "libuvcpp: Postgres pool up on retry %d (%d ms after "
+                   "startup)\n",
+                   attempts, waited_ms);
+      return;
+    }
+    if (waited_ms >= kDbRetryBudgetMs) {
+      std::fprintf(stderr,
+                   "libuvcpp: giving up on the Postgres pool after %d "
+                   "attempts / %d s: %s\n"
+                   "libuvcpp: /async-db and the cache-aside keep their "
+                   "documented empty answers for the rest of this run\n",
+                   attempts, waited_ms / 1000, g_db.last_error().c_str());
+      return;
+    }
+  }
+}
+
 /// Bring the pool up from the two environment variables the profile provides.
 ///
 /// Failure is not fatal, and deliberately so: `/async-db` has a documented
@@ -512,6 +581,32 @@ std::string build_async_db_json(uvcpp_db_status status,
 /// anything else) must still serve them. `DATABASE_MAX_CONN` is the server's
 /// own ceiling, so it is the pool's max; going above it is what makes Postgres
 /// start refusing connections under load.
+///
+/// It is not one-shot either, and that is the part worth stating. The harness
+/// starts Postgres and then this entry, in that order -- but the gate it waits
+/// on (`validate.sh:281-291`) runs *inside* the container (`docker exec ...
+/// pg_isready`, then a `SELECT 1`), so it talks to the Unix socket. The image's
+/// entrypoint runs initdb against a temporary server with `listen_addresses`
+/// empty -- no TCP at all -- seeds it, and only then starts the server that
+/// listens on 5432. Between those two the gate passes and this process starts,
+/// and the first connect comes back `Connection refused` against a sidecar that
+/// is healthy and listening a second later.
+///
+/// Measured, not theorised: the 2026-10-13 `validate-gateway` run failed
+/// exactly there. The dumped container log carries one line -- `cannot open the
+/// Postgres pool: ... port 5432 failed: Connection refused` -- on a container
+/// whose status is `running exit=0`, and the three production-stack assertions
+/// that need the database answered the `!g_db_ready` shapes further down this
+/// file: `/api/items/1` returned `{}` instead of `id=1`, the cache-aside read
+/// MISS on both requests (nothing to populate from), `/api/me` answered 503.
+/// The same run's `/static/*`, `/public/*`, 401s and `POST -> 204` all passed,
+/// which is what puts the fault at the pool rather than at the routes.
+///
+/// It costs more than `/api/*`. The standalone container keeps the host's 8080
+/// and 8443 for the whole run -- the harness does not stop it before the
+/// gateway phase -- so the compose edge proxies every database request back
+/// into this very process: one lost race at startup takes `/async-db`
+/// everywhere with it, the standalone four-parameter check included.
 void init_database() {
   const char* url = std::getenv("DATABASE_URL");
   if (url == nullptr || *url == '\0') {
@@ -528,12 +623,26 @@ void init_database() {
   const uvcpp_db_status status =
       g_db.init(url, 1, static_cast<size_t>(max_conn));
   if (!uvcpp_db_ok(status)) {
-    std::fprintf(stderr, "libuvcpp: cannot open the Postgres pool: %s\n",
-                 g_db.last_error().c_str());
+    std::fprintf(stderr,
+                 "libuvcpp: cannot open the Postgres pool: %s\n"
+                 "libuvcpp: retrying every %d ms (widening to %d ms) for up to "
+                 "%d s\n",
+                 g_db.last_error().c_str(), kDbRetryFirstMs, kDbRetrySlowMs,
+                 kDbRetryBudgetMs / 1000);
+    g_db_retry_thread = std::thread(retry_database, std::string(url),
+                                    static_cast<size_t>(max_conn));
     return;
   }
-  g_db_ready = true;
+  g_db_ready.store(true);
   std::fprintf(stderr, "libuvcpp: Postgres pool up (max=%ld)\n", max_conn);
+}
+
+/// Park the retry thread, if one was ever started. Called on the way out of
+/// `main` and before the statics of that frame -- `g_db` among them -- are
+/// destroyed, because the thread calls into the pool. One slice, at most.
+void stop_db_retry() {
+  g_db_retry_stop.store(true);
+  if (g_db_retry_thread.joinable()) g_db_retry_thread.join();
 }
 
 /// `/async-db?min=&max=&limit=`.
@@ -960,7 +1069,9 @@ int main() {
   // bad DATABASE_URL is reported at startup rather than on the first request.
   // A pool per worker loop would be wrong here: the pool owns the connections,
   // and `acquire()` may block, so N loops x per-loop pools would open N times
-  // the connections Postgres allows for no added concurrency.
+  // the connections Postgres allows for no added concurrency. If this first
+  // attempt fails, `init_database` leaves a retry thread behind rather than
+  // giving up -- see there for the race it is covering.
   init_database();
 
   const int loops = worker_loops();
@@ -1212,5 +1323,10 @@ int main() {
     h2.stop();
     h3.stop();
   }
+
+  // The retry helper, if `init_database` ever started one, calls into `g_db` --
+  // a static that dies once this frame unwinds. Park it here, with the
+  // listeners already down.
+  stop_db_retry();
   return 0;
 }
