@@ -77,9 +77,40 @@ using namespace uvcpp;
 
 namespace {
 
-const int kPortH1 = 8080;
+/// `H1_PORT` / `H2C_PORT`, or the given default.
+///
+/// Read once at startup, before `main`. The two cleartext listeners are the
+/// only ports this entry lets the environment move, and the reason is the
+/// compose stacks: `docker compose ... up` runs this same binary as the
+/// `server` service while the harness's own single-container instance is still
+/// up (validate.sh starts it for the isolated profiles and only removes it on
+/// the way out of the whole run). Both are on host networking, so the second
+/// one to start loses 8080 and 8082 to the first -- and losing a listener is
+/// fatal here, so the compose `server` would exit before answering anything and
+/// the edge would spend the run proxying to the wrong process. The compose
+/// files therefore hand the backend its own two ports. Unset (every isolated
+/// profile, and the benchmark's own `docker run`) nothing changes.
+///
+/// 8443 is deliberately not on that list: it is the edge's port in both compose
+/// profiles, and the compose `server` gets no /certs, so its 8081/8443/8443udp
+/// listeners never open in the first place.
+int env_port(const char* name, int fallback) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || *v == '\0') return fallback;
+  char* end = nullptr;
+  const long n = std::strtol(v, &end, 10);
+  if (end == v || *end != '\0' || n < 1 || n > 65535) {
+    std::fprintf(stderr, "libuvcpp: %s='%s' is not a port -- using %d\n", name,
+                 v, fallback);
+    return fallback;
+  }
+  return static_cast<int>(n);
+}
+
+const int kPortH1 = env_port("H1_PORT", 8080);
 const int kPortH1Tls = 8081;
-const int kPortH2c = 8082;  // TCP, cleartext h2 (prior-knowledge)
+// TCP, cleartext h2 (prior-knowledge), on the platform's dedicated port.
+const int kPortH2c = env_port("H2C_PORT", 8082);
 const int kPortH2 = 8443;   // TCP, TLS + ALPN h2
 const int kPortH3 = 8443;   // UDP, QUIC + ALPN h3
 

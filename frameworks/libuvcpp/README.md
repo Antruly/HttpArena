@@ -60,8 +60,17 @@ so the fallback works without one.
 
 8080 also carries the compose hop. In the three compose profiles (`gateway-64`,
 `gateway-h3`, `production-stack`) it is the backend — the server runs with no
-certificates mounted, so this is the only port it opens, and the edge proxy owns
-8443.
+certificates mounted, so its two cleartext listeners are the only ones it opens,
+and the edge proxy owns 8443. Those two are moved to **8085/8086** in the
+compose files (`H1_PORT` / `H2C_PORT` in the `server` service's environment,
+read by `env_port()` in `main.cc`), because both stacks run on the host
+network and the entry's own ports are not necessarily free there: the harness
+starts an instance of this same image as a plain container for the isolated
+profiles and leaves it up for the whole run, gateway phases included, and the
+`server` service exits 1 if a bind fails. Moving the backend rather than
+detecting the collision keeps the failure loud — an occupied port is still an
+error, it is just no longer a port this deployment claims. Unset, the entry
+binds 8080/8082 exactly as before.
 
 ## Endpoints
 
@@ -221,8 +230,15 @@ is the whole of it.
   differs (`h2load --alpn-list=h3`).
 - **The server is not given `/certs`.** `main.cc` opens its 8081 and 8443
   listeners only when the certificate pair is readable, so with none mounted it
-  comes up on 8080 alone and leaves every TLS port to the edge. Mount the
-  certificates into both services and the two race for 8443.
+  comes up on its two cleartext ports and leaves every TLS port to the edge.
+  Mount the certificates into both services and the two race for 8443.
+- **The backend's ports are 8085/8086, not 8080/8082.** Both ends of the hop are
+  set together — `H1_PORT`/`H2C_PORT` in the compose `server`'s environment and
+  the upstream in the Caddyfile. The stack runs on the host network, and 8080
+  and 8082 are exactly the two ports something else can already be holding
+  there, so the backend is given ports of its own rather than racing for the
+  entry's defaults. The benchmark never runs both at once, so this costs the
+  measured path nothing.
 - **`production-stack`'s JWT verification is the shared sidecar, unmodified** —
   `frameworks/_shared/authsvc/`, built from the same directory every entry uses.
   The edge fires `forward_auth` at it for every `/api/*` request and copies back

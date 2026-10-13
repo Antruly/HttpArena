@@ -11,6 +11,10 @@
 # compose files by name (`compose.<profile>.yml`, with gateway-64 on the legacy
 # `compose.gateway.yml`), and because a real h3-only deployment would put a
 # UDP-capable edge somewhere other than in front of the same backend.
+#
+# The backend hops on 8085/8086 rather than 8080/8082 for the reason spelled out
+# in compose.gateway.yml: both services are on the host network, and the
+# cleartext ports are the ones something else can already be holding.
 services:
   proxy:
     build:
@@ -47,5 +51,7 @@ services:
       - DATABASE_URL=${DATABASE_URL}
       - DATABASE_MAX_CONN=256
       - DATASET_PATH=/data/dataset.json
+      - H1_PORT=8085
+      - H2C_PORT=8086
     volumes:
       - ${DATA_DIR}/dataset.json:/data/dataset.json:ro

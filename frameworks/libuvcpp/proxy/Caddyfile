@@ -3,7 +3,12 @@
 # Stock Caddy terminates TLS and speaks h1/h2/h3 on 8443. It serves /static/*
 # straight off the mounted disk with the precompressed sidecars the dataset
 # ships, and forwards every dynamic path over plain HTTP/1.1 to the libuvcpp
-# server on 127.0.0.1:8080.
+# server on 127.0.0.1:8085.
+#
+# The upstream port is the compose `server` service's H1_PORT, not the 8080 the
+# entry uses when it runs alone: on the host network 8080 may already be taken,
+# and a backend that cannot bind exits. Both ends of the hop are set together --
+# this line and the server's environment in compose.gateway.yml.
 #
 # Why the proxy serves the static tree itself rather than passing it on: the
 # gateway profile's rules require it ("/static/* must be served by the proxy
@@ -41,7 +46,7 @@ https://localhost:8443 {
 	}
 
 	handle {
-		reverse_proxy 127.0.0.1:8080 {
+		reverse_proxy 127.0.0.1:8085 {
 			transport http {
 				versions 1.1
 				keepalive 5m

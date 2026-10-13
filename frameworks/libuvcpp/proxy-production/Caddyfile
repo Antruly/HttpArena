@@ -13,6 +13,11 @@
 # the Authorization header -- the profile's rules put JWT verification at the
 # edge and forbid the framework from doing it, and the server separately
 # refuses any /api/* request that arrives with no X-User-Id at all.
+#
+# Both upstreams name 127.0.0.1:8085 -- the compose `server` service's H1_PORT,
+# not the 8080 the entry uses when it runs alone. The server binds its ports at
+# startup and exits if a bind fails, and this stack is on the host network, so
+# the backend is given ports of its own; see compose.gateway.yml.
 {
 	admin off
 	auto_https off
@@ -32,7 +37,7 @@ https://localhost:8443 {
 	}
 
 	handle /public/* {
-		reverse_proxy 127.0.0.1:8080 {
+		reverse_proxy 127.0.0.1:8085 {
 			transport http {
 				versions 1.1
 				keepalive 5m
@@ -49,7 +54,7 @@ https://localhost:8443 {
 			uri /_auth
 			copy_headers X-User-Id
 		}
-		reverse_proxy 127.0.0.1:8080 {
+		reverse_proxy 127.0.0.1:8085 {
 			transport http {
 				versions 1.1
 				keepalive 5m

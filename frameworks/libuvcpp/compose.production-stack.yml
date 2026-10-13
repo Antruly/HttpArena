@@ -12,11 +12,15 @@
 #                        against Postgres, and the write path.
 #
 # All four on host networking, so what passes between them is loopback: the
-# edge owns 8443, authsvc 9090, the server 8080, the cache 6379.
+# edge owns 8443, authsvc 9090, the server 8085, the cache 6379.
 #
 # The server is not given /certs, for the same reason as the gateway stacks --
 # main.cc opens its TLS listeners only when the certificate pair is readable, so
-# without it the server stays on 8080 and the edge has 8443 to itself.
+# without it the server stays on its two cleartext ports and the edge has 8443
+# to itself. Those two are 8085/8086 rather than the 8080/8082 the entry uses
+# when it runs alone, because on the host network they would otherwise be
+# competing with anything else already listening there; see the longer note in
+# compose.gateway.yml.
 #
 # Two depends_on entries here are map-form with a condition, and both are
 # required rather than stylistic. `depends_on: - cache` waits only for the
@@ -107,6 +111,8 @@ services:
       - DATABASE_URL=${DATABASE_URL}
       - DATABASE_MAX_CONN=256
       - DATASET_PATH=/data/dataset.json
+      - H1_PORT=8085
+      - H2C_PORT=8086
     volumes:
       - ${DATA_DIR}/dataset.json:/data/dataset.json:ro
     depends_on:
