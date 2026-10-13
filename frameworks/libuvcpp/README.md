@@ -72,21 +72,31 @@ detecting the collision keeps the failure loud — an occupied port is still an
 error, it is just no longer a port this deployment claims. Unset, the entry
 binds 8080/8082 exactly as before.
 
+The 8443 h2 listener answers `/json/{count}`, `/async-db`, `/public/baseline`
+and `/public/json/{count}` as well as its own two routes. The reason is
+`localhost`: the edge binds `[::1]:8443` and this process binds `0.0.0.0:8443`,
+so a client that resolves `localhost` takes the edge when the edge is already
+listening and this listener while a freshly built edge image is still starting.
+That window is where a validation run's first checks land, and an endpoint
+missing here reads as a 404 that the deployment is supposed to serve. `/api/*`
+is deliberately absent — those routes need the edge's verified `X-User-Id`, and
+the profile forbids the framework from doing the JWT verification itself.
+
 ## Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/baseline11` | GET | Sums query parameter values |
 | `/baseline11` | POST | Sums query parameters + request body |
-| `/baseline2` | GET | Same, on 8443 over h2 and h3, and on 8080 for the gateway hop |
+| `/baseline2` | GET | Same, on 8443 over h2 and h3, and on the backend's cleartext port for the gateway hop |
 | `/pipeline` | GET | Returns `ok` (plain text) |
 | `/delay/{ms}` | GET | Answers after `ms`, with the parameter echoed verbatim |
-| `/json/{count}?m=N` | GET | First `count` dataset items with `total = price * quantity * m` |
+| `/json/{count}?m=N` | GET | First `count` dataset items with `total = price * quantity * m`; also on 8443 over h2 |
 | `/echo` | POST | Returns the request body back verbatim |
 | `/static/*` | GET | Files from the mounted `/data/static` |
 | `/ws` | WS | Echoes text and binary frames back on the same opcode |
 | `/benchmark.BenchmarkService/GetSum` | POST | gRPC unary, on 8080 over h2c and on 8443 over h2+TLS |
-| `/async-db` | GET | Postgres range query, `min`/`max`/`limit` |
+| `/async-db` | GET | Postgres range query, `min`/`max`/`limit`; also on 8443 over h2 |
 | `/public/baseline` | GET | The `a + b` query sum, anonymous side of the edge |
 | `/public/json/{count}` | GET | Same serializer as `/json/{count}` |
 | `/api/items/{id}` | GET | Cache-aside read, `X-Cache: MISS`/`HIT`, needs `X-User-Id` |

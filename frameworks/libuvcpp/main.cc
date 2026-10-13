@@ -1283,6 +1283,41 @@ int main() {
     // unary-grpc-tls: the same service the h2c leg answers, reached over TLS.
     h2.post("/benchmark.BenchmarkService/GetSum", handle_grpc_sum);
 
+    // Same application, same endpoints, as the h1 listener above. Two reasons
+    // this is not just /baseline2 and /static.
+    //
+    // The first is the same one that put the gateway mix on h1: /json/{n} and
+    // /async-db are this server's endpoints whichever port they are asked on,
+    // and a listener that answers half of them is a listener that answers a
+    // 404 to a request the deployment is supposed to serve.
+    //
+    // The second is narrower and is what a validation run actually hits. The
+    // harness reaches the gateway stack at `https://localhost:8443`, and
+    // `localhost` resolves to both loopbacks: the edge binds [::1]:8443 and
+    // this container binds 0.0.0.0:8443, so curl takes ::1 when the edge is
+    // already listening there and falls back to 127.0.0.1 -- this listener --
+    // for as long as a freshly built edge image is still starting, which is
+    // exactly the window the checks run in. Measured on the gateway-64 run of
+    // 2026-10-13: `PASS [gateway /static/app.js Content-Type]
+    // (application/javascript)` -- this server's MIME, not the edge's
+    // `text/javascript` -- followed by `FAIL [gateway /json]: count=0,
+    // schema=False` and `FAIL [gateway /async-db]: count=0, rating=False`, the
+    // empty-JSON shape of a 404 the edge would never have produced. Serving the
+    // endpoints here means the checks describe this server correctly either
+    // way instead of depending on which of the two bound first.
+    //
+    // /api/* stays off this port on purpose: those routes require the edge's
+    // verified `X-User-Id`, and the profile forbids the framework from doing
+    // the JWT verification itself, so a directly exposed 8443 could only ever
+    // answer them 401.
+    h2.get("/json/:count", handle_json);
+    h2.get("/public/baseline", handle_baseline2);
+    h2.get("/public/json/:count", handle_json);
+    h2.get("/async-db", [&h2](uvcpp_web_request& req, uvcpp_web_response& resp,
+                              uvcpp_web_next next) {
+      handle_async_db(&h2, req, resp, next);
+    });
+
     const int rc = h2.start_background();
     if (rc != 0) {
       std::fprintf(stderr, "libuvcpp: cannot listen on %d (rc=%d)\n", kPortH2,
