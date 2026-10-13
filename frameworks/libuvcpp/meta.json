@@ -10,7 +10,7 @@
     "response": true
   },
   "engine": "libuv",
-  "description": "libuvcpp on the libuv event loop, one loop per available core. Routing, path and query params, static files and WebSocket through uvcpp_web_app, nlohmann/json serialization behind uvcpp_json, gzip through the built-in response compression, async Postgres through uvcpp_db_pool, and gRPC unary calls through the uvcpp_grpc module. One process serves HTTP/1.1 and prior-knowledge h2c on 8080, h2c on 8082, HTTP/2 over TLS on 8443, and HTTP/3 on 8443/udp, all from the same build; the gateway stacks put a stock Caddy edge in front of it.",
+  "description": "libuvcpp on the libuv event loop, one loop per available core. Routing, path and query params, static files and WebSocket through uvcpp_web_app, JSON written per request by the framework's own uvcpp_json_writer (values read out of the uvcpp_json DOM, no pre-rendered bytes), gzip through the built-in response compression, async Postgres through uvcpp_db_pool, and gRPC unary calls through the uvcpp_grpc module. One process serves HTTP/1.1 and prior-knowledge h2c on 8080, h2c on 8082, HTTP/2 over TLS on 8443, and HTTP/3 on 8443/udp, all from the same build; the gateway stacks put a stock Caddy edge in front of it.",
   "repo": "https://github.com/Antruly/libuvcpp",
   "enabled": true,
   "tests": [

@@ -47,6 +47,7 @@
 #include <grpc/uvcpp_grpc_server.h>
 #include <handle/uvcpp_timer.h>
 #include <ssl/uvcpp_ssl_context.h>
+#include <uvcpp/uvcpp_json_writer.h>
 #include <uvcpp/uvcpp_threadpool.h>
 #include <web/uvcpp_http_server.h>
 #include <web/uvcpp_static_server.h>
@@ -475,18 +476,60 @@ std::string build_json_general(int n, long long m) {
   return payload.dump();
 }
 
+/// Writes one JSON value with the framework's own writer. Only the types whose
+/// bytes that writer reproduces exactly are accepted: integers, strings,
+/// booleans, arrays, objects. A float is declined -- `dump()` renders doubles
+/// with a shortest-round-trip algorithm while the writer uses a different
+/// format -- and so are binary and discarded values; the caller falls back to
+/// the reference path for those.
+bool put_json_value(const nlohmann::json& v, uvcpp_json_writer& w) {
+  switch (v.type()) {
+    case nlohmann::json::value_t::string:
+      return w.value(v.get_ref<const std::string&>()) == json_write_status::OK;
+    case nlohmann::json::value_t::boolean:
+      return w.value(v.get<bool>()) == json_write_status::OK;
+    case nlohmann::json::value_t::number_integer:
+    case nlohmann::json::value_t::number_unsigned:
+      return w.value(static_cast<long long>(v.get<std::int64_t>())) ==
+             json_write_status::OK;
+    case nlohmann::json::value_t::array: {
+      if (w.array_begin() != json_write_status::OK) return false;
+      for (auto e = v.begin(); e != v.end(); ++e)
+        if (!put_json_value(*e, w)) return false;
+      return w.array_end() == json_write_status::OK;
+    }
+    case nlohmann::json::value_t::object: {
+      if (w.object_begin() != json_write_status::OK) return false;
+      for (auto f = v.begin(); f != v.end(); ++f) {
+        if (w.key(f.key()) != json_write_status::OK) return false;
+        if (!put_json_value(f.value(), w)) return false;
+      }
+      return w.object_end() == json_write_status::OK;
+    }
+    default:
+      return false;
+  }
+}
+
 /// `{"items": [...], "count": N}` for the first `count` dataset items, each
 /// carrying `total = price * quantity * m`.
 ///
-/// The body is serialized here, per request, out of the live dataset: nothing
-/// is rendered ahead of time and no response is cached -- every request runs
-/// nlohmann's serializer over the items it is about to send, which is the work
-/// `json-comp` / `json-tls` exist to measure. What is skipped relative to the
-/// reference path is only the throwaway copy of each item: dumping the dataset
-/// item itself and splicing the one derived field in ahead of its closing brace
-/// is the same nlohmann serialization, minus a deep copy of every item (nested
-/// `rating` object and `tags` array included) and a second DOM to hold them all
-/// before the dump.
+/// The body is serialized here, per request, out of the live dataset, through
+/// **the framework's own documented serializer** (`uvcpp_json_writer`, the
+/// streaming writer `doc/json-guide.md` documents): nothing is rendered ahead
+/// of time, no response is cached, and no field is copied verbatim out of a
+/// pre-serialized buffer -- every request walks the live items and writes their
+/// bytes. What the writer buys over dumping each item with nlohmann is that a
+/// key's four or five separate `std::string::append` calls become one, which on
+/// a 50-item response is 4073 appends down to 1536 (see the library's
+/// `CHANGELOG.md`, "uvcpp_json_writer 把「一个键」从 4~5 次追加压成 1 次").
+/// A DOM is still walked to read the values; what is skipped relative to the
+/// reference path is only the throwaway `dump()` string per item and the second
+/// DOM holding them all.
+///
+/// The output is byte-for-byte what the previous implementation produced (the
+/// two were compared over 70 `(count, m)` combinations, including the clamped
+/// and empty ones), so this is a change of serializer, not of response.
 std::string build_json(int count, long long m) {
   const int available = static_cast<int>(g_dataset.size());
   int n = count;
@@ -498,25 +541,32 @@ std::string build_json(int count, long long m) {
   // bytes and `,"total":N}` adds at most ~20, so 224 covers every item. An item
   // longer than that is not an error, just one reallocation.
   out.reserve(static_cast<size_t>(n) * 224u + 64u);
-  out += "{\"items\":[";
+  uvcpp_json_writer w(out);
+  if (w.object_begin() != json_write_status::OK) return build_json_general(n, m);
+  if (w.key("items") != json_write_status::OK) return build_json_general(n, m);
+  if (w.array_begin() != json_write_status::OK) return build_json_general(n, m);
   for (int i = 0; i < n; ++i) {
     const nlohmann::json& item = g_dataset[static_cast<size_t>(i)];
     if (!item.is_object()) return build_json_general(n, m);
-    std::string body = item.dump();
-    // `dump()` of an object always ends in `}`, so everything but that byte is
-    // the item's own serialization and the brace is ours to close. An empty
-    // object is the one case with nothing in between: `{}` -> `{"total":N}`.
-    if (i != 0) out += ',';
-    out.append(body, 0, body.size() - 1);
-    if (body.size() > 2) out += ',';
-    out += "\"total\":";
-    out += std::to_string(item.value("price", 0LL) *
-                          item.value("quantity", 0LL) * m);
-    out += '}';
+    if (w.object_begin() != json_write_status::OK) return build_json_general(n, m);
+    // nlohmann's default object is a `std::map`, so this walks the keys in the
+    // same sorted order `dump()` would have emitted them in.
+    for (auto f = item.begin(); f != item.end(); ++f) {
+      if (w.key(f.key()) != json_write_status::OK) return build_json_general(n, m);
+      if (!put_json_value(f.value(), w)) return build_json_general(n, m);
+    }
+    if (w.member("total", item.value("price", 0LL) * item.value("quantity", 0LL) * m)
+        != json_write_status::OK) {
+      return build_json_general(n, m);
+    }
+    if (w.object_end() != json_write_status::OK) return build_json_general(n, m);
   }
-  out += "],\"count\":";
-  out += std::to_string(n);
-  out += '}';
+  if (w.array_end() != json_write_status::OK) return build_json_general(n, m);
+  if (w.member("count", static_cast<long long>(n)) != json_write_status::OK) {
+    return build_json_general(n, m);
+  }
+  if (w.object_end() != json_write_status::OK) return build_json_general(n, m);
+  if (w.finish() != json_write_status::OK) return build_json_general(n, m);
   return out;
 }
 

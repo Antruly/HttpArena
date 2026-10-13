@@ -129,8 +129,22 @@ ENV DEBIAN_FRONTEND=noninteractive
 # criterion is segments per frame on a 1500-byte veth (1.0000 -> 0.0625) and,
 # end to end, 524k-859k frames/s -> 4,111k-5,215k, with a v1.6.1 control arm at
 # 0.71 segments/frame and 1,014k frames/s.
+#
+# The pin now sits on `perf(json): 写出器的键与字符串值改成一次追加` (c8950ae), the
+# change this entry's `/json` handler was rewritten onto. `uvcpp_json_writer`'s
+# `key()` used to append the comma, the opening quote, the escaped body, the
+# closing quote and the colon separately -- four or five out-of-line
+# `std::string::append` calls per key, three per string value, 4073 of them on a
+# 50-item response. They are built in a 256-byte stack buffer and appended once
+# now: 4073 -> 1536, byte-identical output. Measured end to end on this entry at
+# `/json/50?m=6`, server pinned to 6 single-threaded cores and saturated: 80.4 ->
+# 63.2 us of server CPU per request (a repeat run put the pair at 73.8 -> 59.2),
+# and 155.0 -> 141.1 us when the client sends `Accept-Encoding: gzip, br`, where
+# compressing the 8.4 KB body costs more than writing it. The library-side
+# criterion -- the append count, the byte-identity check over 70 `(count, m)`
+# pairs and the per-family timings -- is in the library's `CHANGELOG.md`.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
-ARG LIBUVCPP_REF=219b0da63ce56bb196e2140f972d83136e148bd1
+ARG LIBUVCPP_REF=c8950ae9c8f8cad144eb31d8db7f7e75efb0737f
 
 ARG OPENSSL_VERSION=3.5.0
 

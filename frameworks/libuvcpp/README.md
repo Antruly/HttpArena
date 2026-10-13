@@ -124,15 +124,25 @@ the profile forbids the framework from doing the JWT verification itself.
   documented static handler. Nothing in the entry reads or caches static bytes
   itself — the handler revalidates each request against the file's size and
   `mtime` (seconds and nanoseconds), so a replaced file is served immediately.
-- **JSON is serialized per request** through `nlohmann::json` (which libuvcpp
-  exposes as `uvcpp_json`) and the `total` field is computed inside the loop.
-  Nothing is pre-serialized or cached. What the handler does avoid is the
-  throwaway copy: it serializes the dataset item itself and splices the one
-  derived field in ahead of the closing brace, instead of deep-copying each item
-  into a second DOM and dumping that. Same serializer, same work per request —
-  measured at 2.1x the requests/s of the copy-then-dump shape on this box
-  (`/json/50?m=6`, `-c 64 -m 16 -D 5s`, 6 cores pinned, 3 interleaved rounds:
-  32.1-37.5k rps before, 68.6-80.8k after).
+- **JSON is serialized per request through the framework's own writer.** The body
+  is built by walking the live dataset with `uvcpp_json_writer` — libuvcpp's
+  documented streaming constructor, the one `doc/json-guide.md` describes — and
+  the `total` field is computed inside the loop, from the values the writer is
+  reading. Nothing is pre-serialized, cached, or spliced out of a previously
+  rendered buffer, and the response is byte-for-byte what the previous
+  implementation produced. What moved is what writing it costs: a key now goes
+  out in one `append` instead of four or five, which on this box takes
+  `/json/50?m=6` from 80.4 to 63.2 us of server CPU per request — a repeat run
+  put the same pair at 73.8 and 59.2 us — measured best-of-3 interleaved rounds
+  with the server pinned to 6 single-threaded cores and saturated at 100% of
+  them. With `Accept-Encoding: gzip, br` the pair is 155.0 to
+  141.1 us: compressing the 8.4 KB body costs more than serializing it, so the
+  gain is smaller there, not absent. End to end (h2load, best of 3): 73.7k ->
+  94.2k req/s over h2c and 81.0k -> 96.3k over h1. Against the copy-then-dump
+  shape this handler used before — each item duplicated into a second DOM and
+  the whole payload dumped, still in `main.cc` as `build_json_general`, the
+  fallback for any value the writer cannot reproduce byte-for-byte — the whole
+  path costs 3.0x less CPU per request (176.0 -> 59.2 us).
 - **Compression is the framework's built-in response compression** (gzip), which
   answers `Accept-Encoding` per request and adds no `Content-Encoding` when the
   client sends none. The library has no brotli compressor, so an `Accept-Encoding:
