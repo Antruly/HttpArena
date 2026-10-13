@@ -126,7 +126,13 @@ the profile forbids the framework from doing the JWT verification itself.
   `mtime` (seconds and nanoseconds), so a replaced file is served immediately.
 - **JSON is serialized per request** through `nlohmann::json` (which libuvcpp
   exposes as `uvcpp_json`) and the `total` field is computed inside the loop.
-  Nothing is pre-serialized or cached.
+  Nothing is pre-serialized or cached. What the handler does avoid is the
+  throwaway copy: it serializes the dataset item itself and splices the one
+  derived field in ahead of the closing brace, instead of deep-copying each item
+  into a second DOM and dumping that. Same serializer, same work per request —
+  measured at 2.1x the requests/s of the copy-then-dump shape on this box
+  (`/json/50?m=6`, `-c 64 -m 16 -D 5s`, 6 cores pinned, 3 interleaved rounds:
+  32.1-37.5k rps before, 68.6-80.8k after).
 - **Compression is the framework's built-in response compression** (gzip), which
   answers `Accept-Encoding` per request and adds no `Content-Encoding` when the
   client sends none. The library has no brotli compressor, so an `Accept-Encoding:

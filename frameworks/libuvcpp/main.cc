@@ -456,15 +456,10 @@ long long baseline_sum(const uvcpp_web_request& req) {
   return sum;
 }
 
-/// `{"items": [...], "count": N}` for the first `count` dataset items, each
-/// carrying `total = price * quantity * m`. Serialized per request -- nothing
-/// here is cached or pre-serialized.
-std::string build_json(int count, long long m) {
-  const int available = static_cast<int>(g_dataset.size());
-  int n = count;
-  if (n < 0) n = 0;
-  if (n > available) n = available;
-
+/// The reference path, kept for the shapes the fast path declines: one DOM per
+/// request, exactly what this handler did for every request before. Expects an
+/// already-clamped `n`.
+std::string build_json_general(int n, long long m) {
   nlohmann::json items = nlohmann::json::array();
   for (int i = 0; i < n; ++i) {
     nlohmann::json item = g_dataset[i];
@@ -478,6 +473,51 @@ std::string build_json(int count, long long m) {
   payload["items"] = std::move(items);
   payload["count"] = n;
   return payload.dump();
+}
+
+/// `{"items": [...], "count": N}` for the first `count` dataset items, each
+/// carrying `total = price * quantity * m`.
+///
+/// The body is serialized here, per request, out of the live dataset: nothing
+/// is rendered ahead of time and no response is cached -- every request runs
+/// nlohmann's serializer over the items it is about to send, which is the work
+/// `json-comp` / `json-tls` exist to measure. What is skipped relative to the
+/// reference path is only the throwaway copy of each item: dumping the dataset
+/// item itself and splicing the one derived field in ahead of its closing brace
+/// is the same nlohmann serialization, minus a deep copy of every item (nested
+/// `rating` object and `tags` array included) and a second DOM to hold them all
+/// before the dump.
+std::string build_json(int count, long long m) {
+  const int available = static_cast<int>(g_dataset.size());
+  int n = count;
+  if (n < 0) n = 0;
+  if (n > available) n = available;
+
+  std::string out;
+  // Pure capacity hint: the largest item in this dataset serializes to 172
+  // bytes and `,"total":N}` adds at most ~20, so 224 covers every item. An item
+  // longer than that is not an error, just one reallocation.
+  out.reserve(static_cast<size_t>(n) * 224u + 64u);
+  out += "{\"items\":[";
+  for (int i = 0; i < n; ++i) {
+    const nlohmann::json& item = g_dataset[static_cast<size_t>(i)];
+    if (!item.is_object()) return build_json_general(n, m);
+    std::string body = item.dump();
+    // `dump()` of an object always ends in `}`, so everything but that byte is
+    // the item's own serialization and the brace is ours to close. An empty
+    // object is the one case with nothing in between: `{}` -> `{"total":N}`.
+    if (i != 0) out += ',';
+    out.append(body, 0, body.size() - 1);
+    if (body.size() > 2) out += ',';
+    out += "\"total\":";
+    out += std::to_string(item.value("price", 0LL) *
+                          item.value("quantity", 0LL) * m);
+    out += '}';
+  }
+  out += "],\"count\":";
+  out += std::to_string(n);
+  out += '}';
+  return out;
 }
 
 // ---------------------------------------------------------------------------
