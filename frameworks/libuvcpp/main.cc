@@ -1,17 +1,12 @@
 // libuvcpp entry for HttpArena.
 //
 // Five listeners in one process, one per protocol family the entry subscribes
-// to:
+// to -- plus a sixth that only a compose stack opens, so the harness's
+// readiness probe for the gateway profiles has something to reach on 8080:
 //
 //   8080/tcp   cleartext HTTP/1.1 + h2c  baseline, limited-conn, pipelined,
 //                                        async, json-comp, echo-ws, ws-pipeline,
 //                                        ws-limited, async-db, latency-*
-//                                        -- and the backend hop for the
-//                                        compose stacks: gateway-64 and
-//                                        gateway-h3 forward /baseline2,
-//                                        /json/{n} and /async-db here, and
-//                                        production-stack forwards /public/*
-//                                        and /api/* here
 //                                        -- and unary-grpc, whose plaintext leg
 //                                        is prior-knowledge h2c on the same port
 //                                        as h1 (the two are told apart by the
@@ -21,6 +16,15 @@
 //   8082/tcp   cleartext h2c             baseline-h2c, json-h2c
 //   8443/tcp   TLS, ALPN h2              baseline-h2, static-h2, unary-grpc-tls
 //   8443/udp   QUIC, ALPN h3             baseline-h3, static-h3
+//
+// The compose stacks run this same binary with the two cleartext ports moved
+// (H1_PORT/H2C_PORT = 8085/8086) and with H1_PROBE_PORT=8080. 8085 is the
+// backend hop the edge proxies to: /baseline2, /json/{n} and /async-db for
+// gateway-64 and gateway-h3, /public/* and /api/* for production-stack, and
+// nothing else, because /static/* is the edge's own file_server. 8080 is not
+// part of the hop -- it is where the harness looks for a stack's server, and
+// it is best-effort because a validation run's own instance already holds it.
+// Both are documented at length where they are defined, below.
 //
 // The four TCP legs are uvcpp_web_app instances. That is the framework's
 // documented high-level server, and it is where routing, query and path
@@ -77,9 +81,9 @@ using namespace uvcpp;
 
 namespace {
 
-/// `H1_PORT` / `H2C_PORT`, or the given default.
+/// `H1_PORT` / `H2C_PORT` / `H1_PROBE_PORT`, or the given default.
 ///
-/// Read once at startup, before `main`. The two cleartext listeners are the
+/// Read once at startup, before `main`. The cleartext listeners are the
 /// only ports this entry lets the environment move, and the reason is the
 /// compose stacks: `docker compose ... up` runs this same binary as the
 /// `server` service while the harness's own single-container instance is still
@@ -113,6 +117,27 @@ const int kPortH1Tls = 8081;
 const int kPortH2c = env_port("H2C_PORT", 8082);
 const int kPortH2 = 8443;   // TCP, TLS + ALPN h2
 const int kPortH3 = 8443;   // UDP, QUIC + ALPN h3
+
+// The port the harness's readiness probe looks at, or 0 for "open no such
+// listener".
+//
+// `framework_wait_ready()` has no gateway case, so the three compose profiles
+// fall through to `http://localhost:$PORT/baseline11?a=1&b=1` with `PORT=8080`
+// (scripts/lib/framework.sh, scripts/lib/common.sh) -- and a benchmark run
+// whose probe fails prints "did not come up for $profile; skipping" and
+// publishes no numbers for that profile at all. The edge hop above is
+// therefore not where the harness looks, and this listener is: it answers on
+// 8080 whatever `H1_PORT` says.
+//
+// Best-effort by construction, and that is the whole point of it being
+// separate. A *validation* run has the harness's own single-container instance
+// on host networking for the entire run, so 8080 is already taken when the
+// compose stack starts: this listener loses the bind and stays closed, which
+// costs nothing there, because validate.sh probes the stack through the edge
+// instead. Unset -- every isolated profile, and any `docker run` of this image
+// on its own -- there is no such listener and the entry binds exactly the
+// ports it always has.
+const int kPortH1Probe = env_port("H1_PROBE_PORT", 0);
 
 const char* kCertFile = "/certs/server.crt";
 const char* kKeyFile = "/certs/server.key";
@@ -1200,6 +1225,38 @@ int main() {
   }
 
   // -------------------------------------------------------------------------
+  // 8080 -- the listener the harness's gateway readiness probe reaches
+  // -------------------------------------------------------------------------
+  //
+  // See kPortH1Probe for why this exists and why it is not the edge hop.
+  // `/baseline11` is the path that probe names, and the handler is the same
+  // one the 8080 leg above registers, so what answers is the entry's real
+  // baseline rather than a canned "ok".
+  //
+  // One loop, not `loops`: this answers a curl at startup and nothing else,
+  // and every loop is a thread taken out of the cpuset the profile measures.
+  uvcpp_web_app h1_probe;
+  bool h1_probe_up = false;
+  if (kPortH1Probe != 0) {
+    h1_probe.set_port(kPortH1Probe)
+        .set_log_level(log_level::OFF)
+        .set_access_log(false);
+    h1_probe.get("/baseline11", handle_baseline11);
+    h1_probe.post("/baseline11", handle_baseline11);
+    h1_probe_up = (h1_probe.start_background() == 0);
+    if (!h1_probe_up) {
+      // Deliberately not fatal, unlike every other listener in this file. The
+      // stack is fine without it -- the edge hop is what serves traffic, and
+      // in a validation run this port belongs to the harness's own instance on
+      // purpose.
+      std::fprintf(stderr,
+                   "libuvcpp: :%d is not free for the readiness probe -- "
+                   "continuing without it\n",
+                   kPortH1Probe);
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // 8081 -- TLS, ALPN http/1.1
   // -------------------------------------------------------------------------
   uvcpp_web_app h1_tls;
@@ -1384,6 +1441,10 @@ int main() {
 
   h1.stop();
   h2c.stop();
+  if (h1_probe_up) {
+    h1_probe.stop();
+    h1_probe.join();
+  }
   if (have_certs) {
     h1_tls.stop();
     h2.stop();

@@ -18,9 +18,16 @@
 # whole validation run, including while these compose stacks are. The compose
 # `server` binds its ports at startup and exits 1 if a bind fails, so without
 # this the backend would never come up and the edge would spend the run
-# proxying to whatever else holds 8080. The benchmark itself never runs the two
-# at once (it starts the compose stack instead of the container), so this is
-# about making the stack runnable wherever it lands, not about the score.
+# proxying to whatever else holds 8080.
+#
+# H1_PROBE_PORT=8080 is the flip side of the same fact, and it is why the
+# server still ends up on 8080 after all. The benchmark's readiness probe has
+# no gateway case -- scripts/lib/framework.sh falls through to
+# `http://localhost:8080/baseline11?a=1&b=1` for every profile without one --
+# and a profile whose probe fails is skipped with no numbers published. So the
+# backend opens one more listener there, best-effort: during a validation run
+# it loses the bind to the harness's instance and stays closed, and during a
+# benchmark it comes up and answers the probe. Nothing measures it.
 #
 # Both services run on host networking, so the proxy's upstream hop is loopback
 # rather than a bridge. The cpuset defaults below mirror the reference entry's
@@ -64,5 +71,6 @@ services:
       - DATASET_PATH=/data/dataset.json
       - H1_PORT=8085
       - H2C_PORT=8086
+      - H1_PROBE_PORT=8080
     volumes:
       - ${DATA_DIR}/dataset.json:/data/dataset.json:ro

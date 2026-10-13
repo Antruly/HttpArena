@@ -20,7 +20,10 @@
 # to itself. Those two are 8085/8086 rather than the 8080/8082 the entry uses
 # when it runs alone, because on the host network they would otherwise be
 # competing with anything else already listening there; see the longer note in
-# compose.gateway.yml.
+# compose.gateway.yml. The one port this stack does want on its original number
+# is 8080, which the server also opens best-effort: that is where the
+# benchmark's readiness probe looks for a gateway stack's server, and a profile
+# whose probe fails is skipped with no numbers published at all.
 #
 # Two depends_on entries here are map-form with a condition, and both are
 # required rather than stylistic. `depends_on: - cache` waits only for the
@@ -113,6 +116,7 @@ services:
       - DATASET_PATH=/data/dataset.json
       - H1_PORT=8085
       - H2C_PORT=8086
+      - H1_PROBE_PORT=8080
     volumes:
       - ${DATA_DIR}/dataset.json:/data/dataset.json:ro
     depends_on:

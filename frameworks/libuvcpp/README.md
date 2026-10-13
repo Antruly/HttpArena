@@ -72,6 +72,19 @@ detecting the collision keeps the failure loud — an occupied port is still an
 error, it is just no longer a port this deployment claims. Unset, the entry
 binds 8080/8082 exactly as before.
 
+A compose stack opens one more listener on **8080** (`H1_PROBE_PORT`, set to
+8080 alongside the other two). It is not part of the hop; it is where the
+benchmark's readiness probe looks. `framework_wait_ready()` has no gateway case
+(`scripts/lib/framework.sh`), so a gateway profile falls through to
+`http://localhost:8080/baseline11?a=1&b=1`, and a profile whose probe fails is
+skipped with a warning and publishes no numbers at all — which is what a
+backend that had moved to 8085 does silently. So the stack answers there as
+well, best-effort: in a *validation* run it loses that bind to the harness's own
+instance, which holds 8080 for the whole run by design, logs one line about it
+and carries on serving the edge on 8085. It is one worker loop, it answers
+`/baseline11` with the same handler the 8080 leg registers, and nothing in any
+profile measures it.
+
 The 8443 h2 listener answers `/json/{count}`, `/async-db`, `/public/baseline`
 and `/public/json/{count}` as well as its own two routes. The reason is
 `localhost`: the edge binds `[::1]:8443` and this process binds `0.0.0.0:8443`,
@@ -247,8 +260,11 @@ is the whole of it.
   the upstream in the Caddyfile. The stack runs on the host network, and 8080
   and 8082 are exactly the two ports something else can already be holding
   there, so the backend is given ports of its own rather than racing for the
-  entry's defaults. The benchmark never runs both at once, so this costs the
-  measured path nothing.
+  entry's defaults. 8080 is still opened, but as the readiness probe's landing
+  pad (`H1_PROBE_PORT`) rather than as the hop: the benchmark and the validation
+  run disagree about who owns that port, and the probe only needs something to
+  answer on it. Neither costs the measured path anything — the extra listener is
+  one idle loop.
 - **`production-stack`'s JWT verification is the shared sidecar, unmodified** —
   `frameworks/_shared/authsvc/`, built from the same directory every entry uses.
   The edge fires `forward_auth` at it for every `/api/*` request and copies back
