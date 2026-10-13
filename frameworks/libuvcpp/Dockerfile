@@ -37,11 +37,37 @@ ENV DEBIAN_FRONTEND=noninteractive
 # and the bytes under it re-uploaded, so a SHA is the only thing that fixes
 # which revision gets built. `3fdd6208` was `v1.6.1` -- what the first version
 # of this entry built, and what the platform measured. The pin is now
-# `8cce146a`, the tip of the 1.6.x line (`1.6.18-dev`), because the profiles
+# `2d5fe74`, the tip of the 1.6.x line (`1.6.20-dev`), because the profiles
 # this entry subscribes to need code no release carries yet: cleartext h2, the
 # h3 static handler, gRPC, the h3 CID fix and the on-disk pre-compressed twins
 # all landed after `v1.6.4`. Each was measured against the previous pin before
 # being taken.
+#
+# Two of the commits below the tip fix defects this entry can reach, and the tip
+# is one commit past them for a third reason: it is the revision whose CI is
+# green on all four platforms. `2d5fe74` touches one test file and nothing else
+# (`git diff e3e033e0 2d5fe74 -- src/` is empty), so the library built here is
+# byte-for-byte what `e3e033e0` builds -- what that commit changes is a
+# wall-clock budget in the library's own `quic_stream_func`, which had been
+# calibrated on Linux and came out 8 ms over on the Windows runner, keeping
+# `CI - Windows - MSVC` red on two jobs. Pinning a revision whose CI is green is
+# worth a commit that does not otherwise matter to this entry.
+#
+# The two defect fixes, which are why the pin is the tip rather than the commit
+# the static change landed on:
+#
+#   * `reply_alive()` no longer dereferences the connection pointer it is handed.
+#     It exists to be called *after* a connection may be gone -- it is what the
+#     deferred static handler asks before answering from the thread pool, which is
+#     the path every `static-*` cache miss takes here -- and it used to read
+#     `client->loop_index()` to pick one of the per-loop registration tables.
+#     With one loop a fast path skips that read; with `set_loops(n > 1)`, which
+#     this entry calls, it is a read of freed memory. ASan caught it on Linux
+#     five runs out of five; on Windows the same code is a SEGFAULT, because
+#     Windows hands the pages back to the OS.
+#   * 413 responses read two bytes past the end of their own status text
+#     (`"413 Payload Too Large"` measured as 23 instead of 21). Pre-existing and
+#     ASan-only, but a real out-of-bounds read on that branch.
 #
 # What this pin carries that these profiles depend on, by family:
 #
@@ -92,7 +118,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # `perf(web): 压缩不再每请求新建一个 deflate 内核` (+2.4% on json-comp,
 # non-overlapping over 5 alternating rounds each way) is folded in as well.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
-ARG LIBUVCPP_REF=8cce146aca6e0ba18c3daaea885443f8171a7686
+ARG LIBUVCPP_REF=2d5fe7406fc2ab6c72a7f949ef0f133e3d86bfd2
 
 ARG OPENSSL_VERSION=3.5.0
 
