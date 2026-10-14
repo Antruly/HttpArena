@@ -194,6 +194,21 @@ const char* kStaticRoot = "/data/static";
 uvcpp_web_static_options kStaticOpts = [] {
   uvcpp_web_static_options o;
   o.precompressed = true;
+  // 缓存的校验（"缓存里那份还算不算数"）**就在循环线程上做**，不投线程池。
+  //
+  // 默认档是 `POOL`：每请求一次 `uv_queue_work` + 唤醒 + `after_work` 回来。
+  // 本条目在本机同一份负载下量过这个往返的代价（`cpr` 口径的每请求 CPU、
+  // 以及 `cond_signal`/`mutex_lock` 的每请求次数）：它每请求正好一次池提交，
+  // 而校验本身只是**一次 `stat`**。`LOOP_STAT` 把这三次跨线程往返换成循环线程
+  // 上的一次同步 `stat`。
+  //
+  // 代价写在选项的注释里，这里说清为什么本条目付得起：这个 stat 会挡住同一条
+  // 循环上的其它连接，所以只适合本地盘。平台把数据集挂进容器（`Dockerfile`
+  // 里那次 `COPY`），盘是容器自己的 overlayfs/ext4，`stat` 是微秒级；而本仓
+  // 头文件里那条 46 µs 的读数来自 FUSE 挂载 —— 那种盘上不该开这一档。
+  // 语义一个字都没变：**下一个请求仍然一定拿磁盘上现在的字节**，这也正是
+  // `validate.sh` 那条"改完文件下一个请求就带新字节"的探针要的。
+  o.revalidate = uvcpp_web_revalidate::LOOP_STAT;
   return o;
 }();
 
