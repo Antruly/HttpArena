@@ -130,7 +130,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # end to end, 524k-859k frames/s -> 4,111k-5,215k, with a v1.6.1 control arm at
 # 0.71 segments/frame and 1,014k frames/s.
 #
-# The pin now sits on `perf(json): 写出器的键与字符串值改成一次追加` (c8950ae), the
+# The pin then sat on `perf(json): 写出器的键与字符串值改成一次追加` (c8950ae), the
 # change this entry's `/json` handler was rewritten onto. `uvcpp_json_writer`'s
 # `key()` used to append the comma, the opening quote, the escaped body, the
 # closing quote and the colon separately -- four or five out-of-line
@@ -143,8 +143,57 @@ ENV DEBIAN_FRONTEND=noninteractive
 # compressing the 8.4 KB body costs more than writing it. The library-side
 # criterion -- the append count, the byte-identity check over 70 `(count, m)`
 # pairs and the per-family timings -- is in the library's `CHANGELOG.md`.
+#
+# The pin now sits on `fix(build): brotli 取源码支路把 DLL 路径写进了链接行`
+# (6eede33, 1.6.51-dev): the tip of the library's `master`, 29 commits past
+# `c8950ae`, and the first revision whose four CI legs -- Linux, macOS, MSVC and
+# MinGW-w64 -- are all green. This is a batch, not one named change, so the
+# evidence is per-profile rather than per-commit; each change's own criterion is
+# in the library's `CHANGELOG.md`, and what follows is what this entry's profiles
+# do with them.
+#
+# The change that decides the move is the one `baseline-h3-64` was measuring the
+# absence of. At `v1.6.1` -- the revision the merged entry pins, and the one that
+# produced the board's 58 req/s -- the server decodes the short-header DCID from
+# the *peer's* SCID length, so every 1-RTT packet after the handshake is dropped.
+# `745608c` fixes it and is not in `v1.6.1`. Both arms below are this repository's
+# entry, both libraries are built with the platform's own flag set
+# (`BUILD_SHARED_LIBS=OFF`, `CMAKE_POSITION_INDEPENDENT_CODE=ON`, WEB / WEBAPP /
+# ZLIB / OPENSSL / NGHTTP2 / QUIC / HTTP3 / DB / DB_PGSQL on, everything else off)
+# and both are driven by the platform's own command lines, three runs each,
+# median:
+#
+#   profile (platform command line)        merged @ v1.6.1    this branch @ 6eede33
+#   baseline-h2   -c 64 -m 100                   618,420 rps             724,800 rps
+#   baseline-h3   -c 64 -m 64, --alpn-list=h3         45 rps             200,999 rps
+#   static-h2     -c 64 -m 32                     13,027 rps              28,937 rps
+#   static-h3     -c 64 -m 64, --alpn-list=h3         33 rps              14,223 rps
+#
+# Every 6eede33 row above is 0 3xx / 0 4xx / 0 5xx across all three runs. The two
+# h3 rows are not like-for-like and are not offered as such: the merged entry has
+# no HTTP/3 static leg at all -- it mounts `serve_static` on the h1-TLS and h2
+# listeners only -- so its 33 req/s is 404s, and adding `uvcpp_static_server` on
+# the QUIC listener is what makes `static-h3` a profile this entry can even
+# subscribe to. The h2 rows are the same shape on both sides, so the 1.17x and
+# 2.22x there are the batch's own effect on those two profiles.
+#
+# What else is in the 29 commits, by the criterion each one carries in the
+# `CHANGELOG.md` (these are library-side numbers; the entry-level effect is the
+# h2 row above): the static hot path's `realpath` calls per request 2.734 -> 0.001
+# and its lock acquisitions 9 -> 1, `slot_here()`'s 18.4 -> 0; the revalidation
+# `stat` can move off the thread pool onto the loop thread
+# (`uvcpp_web_revalidate`, default unchanged); the h2 outbound batch is capped at
+# 64 KiB, which is where `static-h2`'s multi-gigabyte residency came from; the
+# static whole-read quota is returned on the worker instead of the loop, which is
+# what the batch of `503`s was; the h3 static leg gets `cache_tag` and a bounded
+# LRU and stops copying the whole body on a hit; an h1 pipeline's final
+# `Connection: close` no longer takes the earlier responses with it; and the h2
+# outbound body is held by reference rather than copied per response. Two optional
+# modules arrive in the same range and both default to OFF -- a yyjson parse
+# backend and a brotli encoder -- so the platform's flag set above builds neither
+# and the binary this Dockerfile produces is unaffected by them.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
-ARG LIBUVCPP_REF=c8950ae9c8f8cad144eb31d8db7f7e75efb0737f
+ARG LIBUVCPP_REF=6eede33a0662631dcf741989e242b7028392cc12
 
 ARG OPENSSL_VERSION=3.5.0
 
