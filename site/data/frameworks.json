@@ -2492,7 +2492,7 @@
   "zinc": {
     "dir": "zinc",
     "description": "Zinc on the Go net/http server, default configuration. Routing and path/query values through the Zinc API, encoding/json via c.JSON, JSON bodies through c.Bind().JSON, gzip through the Zinc compress middleware.",
-    "repo": "https://github.com/gozinc/zinc",
+    "repo": "https://github.com/0mjs/zinc",
     "type": "emerging",
     "engine": "net/http",
     "mode": "standard",
