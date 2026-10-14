@@ -36,25 +36,33 @@ ENV DEBIAN_FRONTEND=noninteractive
 # The library source, pinned by commit rather than by tag: a tag can be moved
 # and the bytes under it re-uploaded, so a SHA is the only thing that fixes
 # which revision gets built. `3fdd6208` was `v1.6.1` -- what the first version
-# of this entry built, and what the platform measured. The pin is now
-# `2d5fe74`, the tip of the 1.6.x line (`1.6.20-dev`), because the profiles
-# this entry subscribes to need code no release carries yet: cleartext h2, the
-# h3 static handler, gRPC, the h3 CID fix and the on-disk pre-compressed twins
-# all landed after `v1.6.4`. Each was measured against the previous pin before
-# being taken.
+# of this entry built, and what the platform measured as the board's 58 req/s on
+# `baseline-h3-64`. The pin has since moved twice: to `2d5fe74` (`1.6.20-dev`),
+# and then to `6eede33` (`1.6.51-dev`), which was the tip of the library's
+# `master` when it was taken and is the revision the platform's fourth run
+# measured. Each move was measured against the previous pin before being taken;
+# the criteria for the `6eede33` batch are further down this file, and each
+# commit's own criterion is in the library's `CHANGELOG.md`.
 #
-# Two of the commits below the tip fix defects this entry can reach, and the tip
-# is one commit past them for a third reason: it is the revision whose CI is
-# green on all four platforms. `2d5fe74` touches one test file and nothing else
-# (`git diff e3e033e0 2d5fe74 -- src/` is empty), so the library built here is
-# byte-for-byte what `e3e033e0` builds -- what that commit changes is a
-# wall-clock budget in the library's own `quic_stream_func`, which had been
-# calibrated on Linux and came out 8 ms over on the Windows runner, keeping
-# `CI - Windows - MSVC` red on two jobs. Pinning a revision whose CI is green is
-# worth a commit that does not otherwise matter to this entry.
+# `6eede33` is also what the library's `v1.7.0` release carries, in the part
+# that decides behaviour: `git diff 6eede33 v1.7.0 -- src/ ':!src/db'` is one
+# hunk, the version macros in `src/uvcpp/uvcpp_version.h` -- and nothing else.
+# The `src/db/` part of that range is the MySQL/PG backends moving behind a
+# `dlopen` seam that is off by default, plus the status enum the seam added; a
+# from-source build that does not ask for it is unaffected. Everything else in
+# the range is packaging, build system and CI, and only one piece of that
+# reaches the ELF build: an `--exclude-libs,ALL` link option that hides symbols
+# arriving from static archives and leaves the library's own API exported -- it
+# changes the dynamic symbol table, not the code. So this entry's numbers on the
+# board are the release's numbers. The pin stays on the commit rather than
+# moving to the tag because moving it would put the entry's source a revision
+# away from the revision the saved results came from, for a library that is --
+# where it counts -- the same one.
 #
-# The two defect fixes, which are why the pin is the tip rather than the commit
-# the static change landed on:
+# The tip is a revision whose CI is green on all four platforms -- Linux,
+# macOS, MSVC and MinGW-w64 -- which is worth commits that do not otherwise
+# matter to this entry. Two of the commits below it fix defects this entry can
+# reach:
 #
 #   * `reply_alive()` no longer dereferences the connection pointer it is handed.
 #     It exists to be called *after* a connection may be gone -- it is what the
@@ -144,13 +152,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 # criterion -- the append count, the byte-identity check over 70 `(count, m)`
 # pairs and the per-family timings -- is in the library's `CHANGELOG.md`.
 #
-# The pin now sits on `fix(build): brotli 取源码支路把 DLL 路径写进了链接行`
-# (6eede33, 1.6.51-dev): the tip of the library's `master`, 29 commits past
-# `c8950ae`, and the first revision whose four CI legs -- Linux, macOS, MSVC and
-# MinGW-w64 -- are all green. This is a batch, not one named change, so the
-# evidence is per-profile rather than per-commit; each change's own criterion is
-# in the library's `CHANGELOG.md`, and what follows is what this entry's profiles
-# do with them.
+# The pin sits on `fix(build): brotli 取源码支路把 DLL 路径写进了链接行`
+# (6eede33, 1.6.51-dev): the tip of the library's `master` when it was taken, 29
+# commits past `c8950ae`, and the first revision whose four CI legs -- Linux,
+# macOS, MSVC and MinGW-w64 -- are all green. This is a batch, not one named
+# change, so the evidence is per-profile rather than per-commit; each change's
+# own criterion is in the library's `CHANGELOG.md`, and what follows is what
+# this entry's profiles do with them.
 #
 # The change that decides the move is the one `baseline-h3-64` was measuring the
 # absence of. At `v1.6.1` -- the revision the merged entry pins, and the one that
