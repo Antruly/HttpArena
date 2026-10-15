@@ -76,17 +76,21 @@ ENV DEBIAN_FRONTEND=noninteractive
 #
 # What this run also carries, and what is *not* in the pin, is the entry side:
 # the JSON profiles answer through the framework's standard serializer again
-# (see the `/json` note below), and the brotli encoder is built on. The first of
-# those is the larger effect, and the fifth run measured its size for us by
-# accident: that run's tree had the entry on `uvcpp_json_writer` (9257623), the
-# revision the maintainer then objected to, and it reported `async-db-1024` at
-# `271.85` us of CPU per response against the fourth run's `407.2` -- a fall that
-# the doc attributes to that one entry commit and to nothing in the library.
+# (see the `/json` note below). The fifth run measured the size of that change
+# for us by accident: its tree had the entry on `uvcpp_json_writer` (9257623),
+# the revision the maintainer then objected to, and it reported `async-db-1024`
+# at `271.85` us of CPU per response against the fourth run's `407.2` -- a fall
+# that the doc attributes to that one entry commit and to nothing in the library.
 # This entry has the DOM path back, so its `async-db` row starts from the higher
 # number, and its `json-*` rows are likewise the ones to compare against the
-# fourth run's rather than the fifth's. Brotli works the other way, on a profile
-# whose score is quadratic in bytes per response (see the note above
-# `ARG LIBUVCPP_REF`).
+# fourth run's rather than the fifth's.
+#
+# The sixth run also turned the framework's brotli encoder on, and this tree turns
+# it back off. That is the one change here that is not a like-for-like restoration
+# and it is argued in full above `ARG LIBUVCPP_REF`; the short version is that the
+# profile's score is quadratic in bytes per response, brotli buys 1.23x on that
+# term, and it costs 1.5x of gzip's CPU even after the encoder state is no longer
+# re-faulted every request.
 #
 # The `8150720` move, like the `02ae418` one above and for the same reason, is a
 # batch whose criterion is *not* an on-board measurement. Its two commits carry
@@ -277,30 +281,63 @@ ENV DEBIAN_FRONTEND=noninteractive
 # LRU and stops copying the whole body on a hit; an h1 pipeline's final
 # `Connection: close` no longer takes the earlier responses with it; and the h2
 # outbound body is held by reference rather than copied per response. Two optional
-# modules arrive in the same range and both default to OFF. A yyjson parse backend
-# is one of them and stays off, so the flag set above builds it out. The brotli
-# encoder is the other, and it is the one optional module this entry turns on.
+# modules arrive in the same range and both default to OFF -- a yyjson parse backend
+# and a brotli encoder -- and neither is in the flag set above.
 #
-# Why brotli is on. It is not a tuning knob -- it is the framework's own response
-# compression middleware, reached only when the client asks for `br`, at the
-# framework's own default quality (`k_brotli_quality_default`, which the header
-# records as the maximum of its own score model). The profile that asks for it is
-# `json-compressed`, whose guide puts "the framework or engine's built-in response
-# compression" under `standard=`, names brotli in its own title, and whose request
-# carries `Accept-Encoding: gzip, br`; equal `q` resolves to `br` by the rank rule in
-# `web/uvcpp_http_compress.cpp`. Measured on the three json-comp bodies -- same
-# entry binary, only the `.so` swapped -- gzip gives 970/1330/1567 B and `br` gives
-# 856/1182/1389 B, which is the encoder's own table in `web/uvcpp_http_compress.h`.
-# The cost lands where the profile pays for it: json-comp is the only profile scored
-# on bytes (`rps * (minBpr/bpr)^2`) and it runs at 101% of its CPU budget, so ~+31.5
-# us per response buys ~11% fewer bytes -- about x1.07 on both json-comp profiles,
-# net of the requests per second that the extra CPU costs. The profiles that merely
-# pass `br` through -- gateway-64 at 58% of budget, gateway-h3 at 58%,
-# production-stack at 49% -- have the CPU headroom to absorb the same compression and
-# collect the smaller bodies for free. `json-tls`, `json-h2c`, `async-db` and the h1
-# baseline profiles send no `Accept-Encoding` at all, and the static legs already
-# serve the `.br` twins shipped in `data/static` whether or not this flag is set: that
-# selection is runtime, in `http_pick_precompressed_variants()`.
+# Why brotli is off, given that `json-compressed` is the one profile in this suite
+# whose request asks for it (`Accept-Encoding: gzip, br`, byte for byte in
+# `requests/json-gzip-*.raw`; equal `q` resolves to `br` by the rank rule in
+# `web/uvcpp_http_compress.cpp`). It was on for exactly one run, the sixth, and that
+# run measured it. Against the fifth run, whose tree built this flag out and answered
+# with gzip, `json-comp-4096` went 335 926 -> 50 389 rps (-85.0%) with `CPU/req`
+# 186.4 -> 1 238.2 us, and `json-comp-16384` 330 411 -> 59 118 with 196.9 -> 1 036.5
+# us. Both runs saturate the same 62 cores (62.4 / 61.3), so that is cost per request
+# and not a core given up. Three other `json-*` profiles carry the same batch's
+# standard serializer and pay 58-66 us each for it (`json-h2c-1024` 38.5 -> 96.6,
+# `json-h2c-4096` 39.5 -> 98.4, `json-tls-4096` 87.4 -> 153.8), which leaves about
+# 990 us of the json-comp increase on the encoder.
+#
+# The ~+31.5 us that was predicted for that encoder was measured single-threaded, and
+# the cost is a function of concurrency too. Same entry, same request, server pinned
+# to 8 cores, only `Accept-Encoding` swapped: gzip 257 us, `br` 508 us with 72.43
+# minor faults per request -- the encoder's ~700 KB of state being handed back to the
+# kernel between requests and re-faulted in. Removing that churn is a real fix and
+# the library's `master` now carries it (`0aaa415`'s thread-local arena -- it is one
+# commit past this pin, and with brotli off it is a no-op for this entry; raising
+# `MALLOC_MMAP_THRESHOLD_` and `MALLOC_TRIM_THRESHOLD_` does the same thing from
+# outside, which is what made the cause unambiguous): faults 72.43 -> 0.00, `br`
+# 508 -> 385 us. 385 against gzip's 257 is still 1.5x, and that is the ratio at its
+# kindest -- 1.94x before the fix. The gap this machine cannot reproduce, the board's
+# 990 us against the 251 us it measures here, is in the direction that makes `br`
+# worse, not better.
+#
+# 1.5x is more than the profile pays for. Its score is `rps * (minBpr/bpr)^2`, so `br`
+# buys `(1429.2/1288.4)^2 = 1.23` on the byte term and has to cost less than 1.23x of
+# gzip to be worth having. It costs 1.5x with the known fix already applied.
+#
+# The other half of the earlier case -- that the profiles merely passing `br` through
+# (gateway-64, gateway-h3, production-stack) are not CPU-bound and so collect the same
+# ~11% smaller bodies for free -- protects a quantity that is not scored anywhere.
+# `effectiveRps` and `minBpr` occur in exactly one file of this repository's profile
+# documentation, `h1/json-compressed/implementation.md`; no other profile is scored on
+# response bytes. `json-tls`, `json-h2c`, `async-db` and the h1 baselines send no
+# `Accept-Encoding` at all. The static legs serve the `.br` twins `data/static` already
+# ships, and that selection is runtime in `http_pick_precompressed_variants()`,
+# unaffected by this flag in either direction. And no client here asks for `br`
+# without also accepting gzip: `json-comp` sends `gzip, br`, the h2 and h3 load
+# generators send `br;q=1, gzip;q=0.8`, and `scripts/validate.sh` reads "Must return
+# Content-Encoding: gzip or br when Accept-Encoding is sent". So gzip is a valid
+# negotiated answer on every profile, and no request comes back uncompressed.
+#
+# The profile's own guide settles it rather than merely permitting it. Its
+# `standard=` rule asks for "the framework standard JSON serialization and the
+# framework or engine's built-in response compression (middleware, filter, or
+# equivalent)"; `tuned=` only adds "as long as the output is valid gzip or brotli";
+# and the worked example under its "Expected response" heading answers a request
+# that carried `Accept-Encoding: gzip, br` with `Content-Encoding: gzip`. The page's
+# title and its SEO title both name brotli, but no rule in it prefers one encoding,
+# and this entry is `mode: standard` -- so the framework's own middleware, answering
+# gzip, is what the guide asks for.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
 ARG LIBUVCPP_REF=02ae41806a25112ee7050ccfd4132138b1eb2630
 
@@ -328,16 +365,14 @@ ARG OPENSSL_VERSION=3.5.0
 # file or directory`. Confirmed against this pin rather than assumed: `g++ -H`
 # resolves `<zlib.h>` to `<prefix>/include/zlib.h`, and it keeps resolving there
 # with the package gone, since `-I` is searched before the system directories.
-# `libbrotli-dev` is here for `-DUVCPP_ENABLE_BROTLI=ON` below, and only the build
-# stage needs it: the library uses `<brotli/encode.h>` inside one `.cpp`, so no
-# installed public header reaches for it and the consumer below compiles against
-# `/opt/uvcpp/include` without it. The CMake side takes the system copy through
-# pkg-config (`libbrotlienc` / `libbrotlidec`) and falls back to `find_path` /
-# `find_library`, so this is the package that keeps the encoder out of the
-# FetchContent branch -- which would otherwise clone brotli at build time.
+# `libbrotli-dev` was listed here while `-DUVCPP_ENABLE_BROTLI` was ON (it is the
+# package that keeps the encoder off the FetchContent branch, which would otherwise
+# clone brotli at build time) and is dropped with the flag: the build out in the flag
+# set below means CMake never looks for it, and the library's `<brotli/encode.h>` is
+# inside one `.cpp`, so nothing in the installed tree reaches for the package either.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        ca-certificates cmake curl g++ git libbrotli-dev libpq-dev make ninja-build \
+        ca-certificates cmake curl g++ git libpq-dev make ninja-build \
  && rm -rf /var/lib/apt/lists/*
 
 # OpenSSL with the QUIC API: static, PIC, no test suite.
@@ -393,7 +428,7 @@ RUN cmake -S . -B build -G Ninja \
         -DUVCPP_BUILD_WEB=ON \
         -DUVCPP_BUILD_WEBAPP=ON \
         -DUVCPP_ENABLE_ZLIB=ON \
-        -DUVCPP_ENABLE_BROTLI=ON \
+        -DUVCPP_ENABLE_BROTLI=OFF \
         -DUVCPP_ENABLE_OPENSSL=ON \
         -DUVCPP_ENABLE_NGHTTP2=ON \
         -DUVCPP_ENABLE_QUIC=ON \
@@ -422,15 +457,14 @@ RUN g++ -std=c++11 -O2 -DNDEBUG -o /server main.cc \
 
 FROM ubuntu:24.04
 
-# libstdc++ for the entry's own objects, libpq5 and libbrotli1 for the two shared
-# libraries the build above could not absorb. `libbrotli1` is the second of those:
-# unlike zlib and libuv, which the project fetches and links statically,
-# `UVCPP_ENABLE_BROTLI` takes the system copy, so `libuvcpp.so` carries
-# `libbrotlienc.so.1` and `libbrotlidec.so.1` in its `DT_NEEDED` and the server does
-# not start without them. On noble they are both files of that one package -- the
-# name is not `libbrotlienc1`, which exists on Debian but not here (`libbrotli-dev`
-# itself depends on `libbrotli1`, so the build stage already pulls it in; the
-# runtime stage needs it said out loud).
+# libstdc++ for the entry's own objects, and libpq5 for the one shared library the
+# build above could not absorb. `libbrotli1` was the other one while
+# `-DUVCPP_ENABLE_BROTLI` was ON: unlike zlib and libuv, which the project fetches
+# and links statically, that flag takes the system copy, so `libuvcpp.so` carried
+# `libbrotlienc.so.1` and `libbrotlidec.so.1` in its `DT_NEEDED` and the server would
+# not start without them (on noble both are files of that one package -- the name is
+# not `libbrotlienc1`, which exists on Debian but not here). With the flag off the
+# library carries neither, and this stage does not need them.
 #
 # apt pulls in libpq's transitive closure
 # (libgssapi, libldap, libgnutls, libssl3t64, ...) on its own -- that OpenSSL
@@ -439,7 +473,7 @@ FROM ubuntu:24.04
 # and h3 listeners.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        libbrotli1 libpq5 libstdc++6 \
+        libpq5 libstdc++6 \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/uvcpp/lib/libuvcpp.so /opt/uvcpp/lib/libuvcpp.so

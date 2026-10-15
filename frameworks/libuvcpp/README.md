@@ -162,18 +162,33 @@ the profile forbids the framework from doing the JWT verification itself.
   writer also skipped the per-item DOM copy the DOM path makes. Both figures are
   the ones this entry reported in earlier revisions; they are recorded here
   because the entry no longer collects them.
-- **Compression is the framework's built-in response compression** (gzip and
-  brotli), which answers `Accept-Encoding` per request and adds no
-  `Content-Encoding` when the client sends none. Both encoders are the library's
-  own middleware at its own defaults; the build turns the brotli one on
-  (`-DUVCPP_ENABLE_BROTLI=ON` in the Dockerfile) because it is the library's
-  default quality that the header records as the maximum of its own score model
-  for this profile. `json-compressed` asks for it — its guide lists the
-  framework's built-in compression under `standard=`, its title names brotli, and
-  its request carries `Accept-Encoding: gzip, br`, where equal `q` resolves to
-  `br`. On the three json-comp bodies the encoder produces 856/1182/1389 B
-  against gzip's 970/1330/1567 B. `Accept-Encoding` is still honoured per
-  request, so a client that asks for gzip alone still gets gzip.
+- **Compression is the framework's built-in response compression** (gzip), which
+  answers `Accept-Encoding` per request and adds no `Content-Encoding` when the
+  client sends none, at the library's own default level. The library also
+  carries a brotli encoder; the build turns it off (`-DUVCPP_ENABLE_BROTLI=OFF`
+  in the Dockerfile). It was on for one run, and that run is why it is off.
+  `json-compressed` is the one profile in the suite scored on response bytes
+  (`effectiveRps = rps * (minBpr / bpr)^2`), so it is the only place a smaller
+  body buys anything, and there the smaller body has to be paid for out of
+  requests per second. The two runs' own reported `bpr` put brotli at 1288.4 B
+  per response against gzip's 1429.2, so brotli's whole win on that one term is
+  `(1429.2 / 1288.4)^2 = 1.23`. Its cost was above that: 5.06x gzip's
+  per-request CPU on the board (1238.2 us against the 244.5 us that leg reads
+  with gzip, both including the serializer change the other json legs pay too),
+  and 1.94x on the same request measured here with the server pinned to 8 cores
+  (508.0 us against 257.0 us). So it is a net loss on the only term it can move.
+  Turning it off costs nothing else: `Accept-Encoding` is still honoured per
+  request, so a client that asks for gzip alone gets gzip; every client these
+  profiles use that offers `br` also accepts gzip (`gzip, br` on json-comp,
+  `br;q=1, gzip;q=0.8` on the h2 and h3 generators); and the static legs'
+  pre-compressed twins are announced the same way whichever encoder the build
+  links -- see the next bullet. The profile's own guide asks for what it gets: its
+  `standard=` rule wants "the framework or engine's built-in response compression
+  (middleware, filter, or equivalent)", its `tuned=` rule only adds "as long as the
+  output is valid gzip or brotli", and the worked example under "Expected response"
+  answers a request that carried `Accept-Encoding: gzip, br` with
+  `Content-Encoding: gzip`. Brotli appears in the page's title, but no rule there
+  prefers it, and this entry is `mode: standard`.
 - **Where the dataset ships a pre-compressed twin, the handler serves it**
   (`precompressed`, on for every static leg). 15 of the dataset's 20 assets carry
   a `.br` and a `.gz` beside them, and the static profiles send
