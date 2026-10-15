@@ -939,6 +939,193 @@ std::string build_async_db_json(uvcpp_db_status status,
   return payload.dump();
 }
 
+/// Writes one `tags` cell straight into the writer.
+///
+/// `tags` is JSONB and the driver hands JSONB over as text, so the column
+/// already arrives as the array literal (`["fast", "new"]`). `parse_tags` above
+/// re-parses that into a DOM and the serializer dumps the DOM back out -- a lexer
+/// pass and a tree per row, 13.8% of this profile's client CPU under callgrind,
+/// to recover bytes the string is already holding.
+///
+/// So this walks the literal instead, and normalises the whitespace Postgres
+/// puts after the commas, which is exactly what `parse` + `dump()` produce. It
+/// copies through only what it can reproduce byte for byte: a flat array of
+/// strings whose bytes are all printable ASCII (`0x20`-`0x7E`) other than `"` and
+/// `\`, which cannot appear inside one. Every other shape is a decline, and a
+/// decline puts the whole response back on the DOM path above, where
+/// `parse_tags`' "a value that will not parse becomes `[]`" rule lives:
+///
+///   - a number would come back re-rendered from a double (`1.50` -> `1.5`),
+///   - `true`/`false`/`null` and a nested array or object would need the tree,
+///   - a `\"` or a `\uXXXX` would be re-encoded by `dump()`'s escaper,
+///   - a byte outside printable ASCII is where the two serializers may part
+///     ways: `dump()` validates and repairs UTF-8, and what a byte `>= 0x80`
+///     means depends on the database's encoding, so those bytes are not copied
+///     through on a `==` argument,
+///   - a literal that is not a well-formed array of strings is not JSON at all.
+///
+/// The printable-ASCII rule is what makes the byte identity a property of the
+/// accepted set rather than of the responses the proof below happened to sample.
+/// RFC 8259 requires escaping only `"`, `\` and the bytes below `0x20`, and the
+/// walker admits none of those three: `"` ends the string, `\` is a decline, and
+/// the range check leaves the controls out. The library's serializer escapes
+/// exactly that set and copies `0x80` upwards through untouched (`uvcpp_json_writer`'s
+/// escape table says so in as many words), and `dump()` follows the same rule, so
+/// every accepted byte reaches both outputs unchanged.
+bool async_db_tags(uvcpp_json_writer& w, const std::string& text) {
+  const char* p = text.data();
+  const size_t n = text.size();
+  // A NULL cell and an empty string both read back as "" here, and both parse
+  // to the empty array -- which is what `parse_tags` answers for either.
+  if (n == 0) {
+    return w.array_begin() == json_write_status::OK &&
+           w.array_end() == json_write_status::OK;
+  }
+  if (n < 2 || p[0] != '[' || p[n - 1] != ']') return false;
+  if (w.array_begin() != json_write_status::OK) return false;
+  const size_t end = n - 1;  // the closing `]`
+  size_t i = 1;              // past the opening `[`
+  bool first = true;
+  for (;;) {
+    while (i < end && (p[i] == ' ' || p[i] == '\t' || p[i] == '\n' ||
+                       p[i] == '\r')) {
+      ++i;
+    }
+    if (i == end) break;  // the `]`, and nothing but whitespace before it
+    if (!first) {
+      if (p[i] != ',') return false;
+      ++i;
+      while (i < end && (p[i] == ' ' || p[i] == '\t' || p[i] == '\n' ||
+                         p[i] == '\r')) {
+        ++i;
+      }
+      if (i == end) return false;  // a trailing comma
+    }
+    if (p[i] != '"') return false;
+    size_t j = i + 1;
+    while (j < end && p[j] != '"') {
+      if (p[j] == '\\') return false;
+      const unsigned char c = static_cast<unsigned char>(p[j]);
+      if (c < 0x20 || c > 0x7E) return false;
+      ++j;
+    }
+    if (j == end) return false;  // unterminated
+    if (w.value(p + i + 1, j - i - 1) != json_write_status::OK) return false;
+    i = j + 1;
+    first = false;
+  }
+  return w.array_end() == json_write_status::OK;
+}
+
+/// The same bytes `build_async_db_json` produces, written straight through
+/// `uvcpp_json_writer`: no DOM for the rows and no throwaway `dump()` string.
+///
+/// The keys come out in the order nlohmann's `std::map` sorts them into, which
+/// is the order `dump()` emits and the order `flat_write_item` hard-codes for
+/// `/json` -- `active`, `category`, `id`, `name`, `price`, `quantity`, `rating`,
+/// `tags`, with `count` before `score` inside `rating` and `count` before
+/// `items` at the top.
+///
+/// The columns are read by position, not by name: the SELECT above is a fixed
+/// list, and a name lookup is a linear scan of the column names, which at 200
+/// lookups per response was 12.4% of this profile's client CPU. A result whose
+/// columns are not that SELECT is caught by the proof in `async_db_json` below,
+/// which compares these bytes against the name-based path's before this one is
+/// allowed to answer.
+///
+/// An empty return means "declined" and `async_db_json` re-runs the DOM path. A
+/// built response is never empty -- it always opens with `{"count":`.
+std::string build_async_db_json_writer(uvcpp_db_status status,
+                                       const uvcpp_db_table& table) {
+  const std::string declined;
+  if (!uvcpp_db_ok(status)) return declined;
+  const std::vector<uvcpp_db_row>& rows = table.rows();
+  std::string out;
+  out.reserve(rows.size() * 224u + 32u);
+  uvcpp_json_writer w(out);
+  // The root object first: `key()` is `MISUSE` outside an object, so a key at
+  // depth 0 fails the writer for good. `build_json_flat` opens its object the
+  // same way for the same reason.
+  if (w.object_begin() != json_write_status::OK) return declined;
+  if (!flat_key(w, "count")) return declined;
+  if (w.value(static_cast<long long>(rows.size())) != json_write_status::OK) {
+    return declined;
+  }
+  if (!flat_key(w, "items")) return declined;
+  if (w.array_begin() != json_write_status::OK) return declined;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    const uvcpp_db_row& row = rows[i];
+    if (w.object_begin() != json_write_status::OK) return declined;
+    if (!flat_key(w, "active")) return declined;
+    if (w.value(row[5].to_bool()) != json_write_status::OK) return declined;
+    if (!flat_key(w, "category")) return declined;
+    if (w.value(row[2].to_text()) != json_write_status::OK) return declined;
+    if (!flat_key(w, "id")) return declined;
+    if (w.value(row[0].to_int64()) != json_write_status::OK) return declined;
+    if (!flat_key(w, "name")) return declined;
+    if (w.value(row[1].to_text()) != json_write_status::OK) return declined;
+    if (!flat_key(w, "price")) return declined;
+    if (w.value(row[3].to_int64()) != json_write_status::OK) return declined;
+    if (!flat_key(w, "quantity")) return declined;
+    if (w.value(row[4].to_int64()) != json_write_status::OK) return declined;
+    if (!flat_key(w, "rating")) return declined;
+    if (w.object_begin() != json_write_status::OK) return declined;
+    if (!flat_key(w, "count")) return declined;
+    if (w.value(row[8].to_int64()) != json_write_status::OK) return declined;
+    if (!flat_key(w, "score")) return declined;
+    if (w.value(row[7].to_int64()) != json_write_status::OK) return declined;
+    if (w.object_end() != json_write_status::OK) return declined;
+    if (!flat_key(w, "tags")) return declined;
+    if (!async_db_tags(w, row[6].to_text())) return declined;
+    if (w.object_end() != json_write_status::OK) return declined;
+  }
+  if (w.array_end() != json_write_status::OK) return declined;
+  if (w.object_end() != json_write_status::OK) return declined;
+  if (w.finish() != json_write_status::OK) return declined;
+  return out;
+}
+
+/// Whether the writer path has been shown to reproduce the reference path's
+/// bytes: `-1` is "not proven yet", and while it is unproven the reference path
+/// answers. The writer path is never served unproven.
+std::atomic<int> g_async_json_ok(-1);
+
+/// The body `handle_async_db` sends.
+///
+/// The proof is the point, and it is the same one `/json` runs before its
+/// flattened path is allowed on: the writer path may answer only after it has
+/// produced the reference path's bytes on a live response. It runs on the first
+/// response that carries at least one row, because every shape that could
+/// differ -- a numeric or nested `tags`, an escaped string, columns in another
+/// order -- is a row shape, so an empty result set proves nothing and does not
+/// count. One extra DOM build per process. After that the flag decides, and the
+/// DOM is reached again only when the writer declines a response.
+std::string async_db_json(uvcpp_db_status status, const uvcpp_db_table& table) {
+  const int proven = g_async_json_ok.load(std::memory_order_acquire);
+  if (proven < 0 && uvcpp_db_ok(status) && !table.rows().empty()) {
+    std::string fast = build_async_db_json_writer(status, table);
+    const std::string dom = build_async_db_json(status, table);
+    if (!fast.empty() && fast == dom) {
+      g_async_json_ok.store(1, std::memory_order_release);
+      std::fprintf(stderr, "libuvcpp: /async-db answers from the writer path\n");
+      return fast;
+    }
+    g_async_json_ok.store(0, std::memory_order_release);
+    if (!fast.empty()) {
+      std::fprintf(stderr,
+                   "libuvcpp: the writer path does not reproduce the reference "
+                   "bytes for /async-db -- /async-db stays on the reference "
+                   "path\n");
+    }
+    return dom;
+  }
+  if (proven > 0) {
+    std::string fast = build_async_db_json_writer(status, table);
+    if (!fast.empty()) return fast;
+  }
+  return build_async_db_json(status, table);
+}
+
 /// The retry half of init_database(): keep trying to open the pool, and give up
 /// for good once the budget is spent, so a database that is simply not there
 /// does not leave a thread working for the life of the run.
@@ -1094,7 +1281,7 @@ void handle_async_db(uvcpp_web_app* app, uvcpp_web_request& req,
   const int rc = g_db.query(
       app->loop(), kAsyncDbSql, params,
       [rp, next](uvcpp_db_status status, const uvcpp_db_table& table) {
-        rp->json_str(build_async_db_json(status, table));
+        rp->json_str(async_db_json(status, table));
         rp->end();
         next();
       });
