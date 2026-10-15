@@ -5,16 +5,24 @@ libuvcpp on the libuv event loop, one loop per available core.
 ## Stack
 
 - **Language:** C++11
-- **Library:** libuvcpp 1.6.x ([repo](https://github.com/Antruly/libuvcpp)),
+- **Library:** libuvcpp 1.7.x ([repo](https://github.com/Antruly/libuvcpp)),
   built from source in the image
 - **Build:** `cmake -DCMAKE_BUILD_TYPE=Release` on `ubuntu:24.04`, with libuv,
   llhttp, zlib, nghttp2, ngtcp2, nghttp3 and OpenSSL 3.5 all built statically
   into `libuvcpp.so`; the entry is `g++ -std=c++11 -O2 -DNDEBUG`
 
-The library is built from source rather than installed from the published
-`libuvcpp-1.6.x-linux-x64` release package, because that package is built with
-both database backends off — the release workflow asserts it with an `ldd` check
-that fails if `libpq.so` appears — and `/async-db` needs the Postgres backend.
+The library is built from source rather than installed from a published
+`libuvcpp-<version>-linux-x64` release package. That package was the only
+alternative when this entry pinned `v1.6.1`, and at that revision all six of the
+release workflow's legs passed `-DUVCPP_ENABLE_DB_MYSQL=OFF
+-DUVCPP_ENABLE_DB_PGSQL=OFF` — the workflow asserts it with an `ldd` check that
+fails if `libpq.so` appears — while `/async-db` needs the Postgres backend. The
+pin has since moved onto development revisions: the `v1.7.0` tag is the nearest
+release, the pin is three commits past it, and a release package exists only for
+a tag, so building the pinned SHA from source is the only way to build exactly
+what the pin names. The `1.7.0` packages do carry both remote backends, behind
+the runtime-load seam that is why the same `ldd` list still passes, so the
+reason is now "the pin is not a release" rather than "the release cannot do it".
 Everything else about the build follows that same release recipe. The pinned
 revision installs `include/zlib.h` and `include/zconf.h` along with the library,
 which matters because `web/uvcpp_ws_parser.h` includes `<zlib.h>` whenever
@@ -204,10 +212,24 @@ the profile forbids the framework from doing the JWT verification itself.
   between dialects, on purpose — `?` is a legal operator in Postgres for jsonb
   and hstore, so a translation layer could not tell the two apart. This is the
   entry's only Postgres-specific line.
-- **`tags` is re-parsed.** Postgres returns JSONB as text (OID 3802 is not one
-  of the driver's mapped types, and an unmapped OID degrades to the string libpq
-  returned), and that string *is* the JSON array — so it is parsed back into an
-  array rather than spliced in as a quoted string.
+- **`tags` is walked, not re-parsed.** Postgres returns JSONB as text (OID 3802
+  is not one of the driver's mapped types, and an unmapped OID degrades to the
+  string libpq returned), and that string *is* the JSON array — so it goes into
+  the response as an array rather than as a quoted string. The response is built
+  with the framework's `uvcpp_json_writer`, and for `tags` that means walking the
+  literal and copying the strings it holds, normalising the whitespace Postgres
+  puts after the commas — the bytes `nlohmann::json::parse` followed by `dump()`
+  produced. The walk declines anything it cannot reproduce byte for byte: a
+  number (which `dump()` would re-render from a double), `true`/`false`/`null`, a
+  nested value, a `\"` or `\uXXXX` escape, or a byte outside printable ASCII
+  (where the two serializers may part ways). A decline puts the whole response
+  back on the DOM path, which is also where `parse_tags`' rule for a value that
+  will not parse — an empty array — still lives.
+- **The writer path is proved before it answers.** The first response that
+  carries at least one row is built both ways and the writer's bytes must equal
+  the reference path's before the writer is allowed to answer with them; until
+  then, and after any decline, the reference path answers. One extra DOM build
+  per process, and the server logs which path took over.
 - **Failure is not fatal and not silent-in-the-wrong-way.** With no
   `DATABASE_URL`, or a pool that will not open, `/async-db` answers the
   documented `{"items":[],"count":0}` and the other profiles serve normally.

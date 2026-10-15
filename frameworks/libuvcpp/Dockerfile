@@ -37,12 +37,33 @@ ENV DEBIAN_FRONTEND=noninteractive
 # and the bytes under it re-uploaded, so a SHA is the only thing that fixes
 # which revision gets built. `3fdd6208` was `v1.6.1` -- what the first version
 # of this entry built, and what the platform measured as the board's 58 req/s on
-# `baseline-h3-64`. The pin has since moved twice: to `2d5fe74` (`1.6.20-dev`),
-# and then to `6eede33` (`1.6.51-dev`), which was the tip of the library's
-# `master` when it was taken and is the revision the platform's fourth run
-# measured. Each move was measured against the previous pin before being taken;
-# the criteria for the `6eede33` batch are further down this file, and each
-# commit's own criterion is in the library's `CHANGELOG.md`.
+# `baseline-h3-64`. The pin has since moved three times: to `2d5fe74`
+# (`1.6.20-dev`), then to `6eede33` (`1.6.51-dev`), which was the tip of the
+# library's `master` when it was taken and is the revision the platform's fourth
+# run measured, and now to `8150720` (`1.7.2-dev`), which is the `v1.7.0` tag
+# plus one documentation commit and two that change code.
+# Each move was measured against the previous pin before being taken; the
+# criteria for the `6eede33` batch are further down this file, and each commit's
+# own criterion is in the library's `CHANGELOG.md`.
+#
+# The `8150720` move is the one batch here whose criterion is *not* an on-board
+# measurement. Both commits carry a local deterministic counter as their
+# criterion -- `ebeaa20` is `-1.90%` user-mode instructions per request on the
+# h1 shape (22,459.6 -> 22,032.4 Ir, callgrind, the path normalisation
+# collapsing to one function with a fast path for the already-normal form), and
+# `8150720` is `204.78 -> 102.77` `malloc`s per response on the async-db shape
+# (the result-set vectors now reserve, which `PQntuples`/`PQnfields` let them do
+# exactly). Neither is offered as a predicted board movement. The h1 profiles
+# are all `pipeline = 1`, so `-1.90%` of user-mode instructions is about `0.35%`
+# of the end-to-end time on those profiles, which is smaller than the spread
+# between two platform readings of the same profile; and `async-db` is
+# Reference-only, contributing nothing to the board's score and showing up only
+# in its own `cpu_per_req_us`, which is user plus system time where the change
+# is on the user side. So both are accounted for as "the counter certainly went
+# down", not as a score, and what this revision is for is the fifth run, whose
+# numbers will say whether either is visible from outside. The library-side
+# criteria and the guards (byte-identical response bodies, the postgres suite
+# byte-identical across arms, 127/127 ctest) are in its `CHANGELOG.md`.
 #
 # `6eede33` is also what the library's `v1.7.0` release carries, in the part
 # that decides behaviour: `git diff 6eede33 v1.7.0 -- src/ ':!src/db'` is one
@@ -53,11 +74,16 @@ ENV DEBIAN_FRONTEND=noninteractive
 # the range is packaging, build system and CI, and only one piece of that
 # reaches the ELF build: an `--exclude-libs,ALL` link option that hides symbols
 # arriving from static archives and leaves the library's own API exported -- it
-# changes the dynamic symbol table, not the code. So this entry's numbers on the
-# board are the release's numbers. The pin stays on the commit rather than
-# moving to the tag because moving it would put the entry's source a revision
-# away from the revision the saved results came from, for a library that is --
-# where it counts -- the same one.
+# changes the dynamic symbol table, not the code. So the fourth run's numbers
+# are `v1.7.0`'s numbers, and the distance from the tag to this pin is small and
+# fully accounted for: `git diff --stat v1.7.0 8150720 -- src/ ':!src/db'` is
+# the version macros plus four files under `src/webapp/` -- all of them
+# `ebeaa20`, the path normalisation -- and `git diff v1.7.0 8150720 -- src/db/`
+# is `8150720`, the result-set reservation. The third commit in the range,
+# `d9581d9`, is the download table in `README.md`: documentation only. The pin
+# stays on the commit rather than moving to the tag because the two behavioural
+# commits have no tag -- they are unreleased, and they are the whole reason this
+# revision is here.
 #
 # The tip is a revision whose CI is green on all four platforms -- Linux,
 # macOS, MSVC and MinGW-w64 -- which is worth commits that do not otherwise
@@ -201,7 +227,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # backend and a brotli encoder -- so the platform's flag set above builds neither
 # and the binary this Dockerfile produces is unaffected by them.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
-ARG LIBUVCPP_REF=6eede33a0662631dcf741989e242b7028392cc12
+ARG LIBUVCPP_REF=81507207a4ad496a66019a40e3993dcf34ba275f
 
 ARG OPENSSL_VERSION=3.5.0
 
