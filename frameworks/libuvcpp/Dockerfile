@@ -37,20 +37,23 @@ ENV DEBIAN_FRONTEND=noninteractive
 # and the bytes under it re-uploaded, so a SHA is the only thing that fixes
 # which revision gets built. `3fdd6208` was `v1.6.1` -- what the first version
 # of this entry built, and what the platform measured as the board's 58 req/s on
-# `baseline-h3-64`. The pin has since moved four times: to `2d5fe74`
+# `baseline-h3-64`. The pin has since moved five times: to `2d5fe74`
 # (`1.6.20-dev`), then to `6eede33` (`1.6.51-dev`), which was the tip of the
 # library's `master` when it was taken and is the revision the platform's fourth
 # run measured, then to `8150720` (`1.7.2-dev`), which is the `v1.7.0` tag plus
-# one documentation commit and two that change code, and now to `02ae418`
-# (`1.7.2-dev`), which is four code commits past it.
+# one documentation commit and two that change code, then to `02ae418`
+# (`1.7.2-dev`), which is four code commits past it and is what the sixth run
+# carried, and now to `1f6a8fb` (`1.7.2-dev`), which is two code commits and a
+# documentation commit past `02ae418` and was the tip of the library's `master`
+# when it was taken.
 # Each move was measured against the previous pin before being taken; the
 # criteria for the `6eede33` batch are further down this file, and each commit's
 # own criterion is in the library's `CHANGELOG.md`.
 #
-# The `02ae418` move is for the next run, and like the `8150720` move it is a
-# batch whose members carry local deterministic counters rather than on-board
-# measurements. The four code commits between the two pins -- the other two are
-# documentation -- and what each one's criterion is:
+# The `02ae418` move was the pin the sixth run carried, and like the `8150720`
+# move it is a batch whose members carry local deterministic counters rather than
+# on-board measurements. The four code commits between the two pins -- the other
+# two are documentation -- and what each one's criterion is:
 #
 #   * `e716010` stops the database path from building a log line when no log
 #     callback is installed: `106.16 / 106.15 -> 102.18 / 102.22` allocations
@@ -74,6 +77,45 @@ ENV DEBIAN_FRONTEND=noninteractive
 #     The instruction figure is 0.83% of one handler, smaller than the spread
 #     between two board readings; the counters are the criterion.
 #
+# The `1f6a8fb` move is for the next run and is the shortest batch so far: two
+# code commits and a documentation one past `02ae418`, neither of the two
+# touching a public header, so this entry needs no code change for it. One of the
+# two cannot reach this build at all, and the other is the one that matters.
+#
+#   * `0aaa415` gives the brotli encoder the ~700 KiB of state it needs per
+#     request out of a thread-local arena instead of the heap. brotli has no
+#     `BrotliEncoderReset()` -- which is why the deflate arm can carry one kernel
+#     across requests and this one cannot -- so the state was created and
+#     destroyed on every request, two of its blocks are 256 KiB, and those are
+#     above glibc's 128 KiB threshold, so `free` handed them back to the kernel
+#     for the next request to fault in again. On the local `br` arm: `72.43 ->
+#     0.00` minor faults per request and `508 -> 385` us of CPU per request, with
+#     a gzip arm as the negative control (`+0.8%`, no faults either way) and the
+#     compressed bytes bit-for-bit the same. The commit's own run of the same
+#     effect reads `72.165 -> 0.001` and `515.5 -> 398.5` us; the numbers already
+#     in this file above `ARG LIBUVCPP_REF` are this entry's rig on the same
+#     request.
+#     **This build compiles none of it**: the arena, the encoder
+#     call and the frame in between all sit under `#if UVCPP_BROTLI_ENABLE` in
+#     `src/web/uvcpp_http_compress.cpp`, and the flag below is
+#     `-DUVCPP_ENABLE_BROTLI=OFF`. It comes along because a pin is a commit and
+#     not a patch list.
+#   * `1f6a8fb` moves the two tables behind the static handler's `LOOP_STAT`
+#     cache lookup to a front copy per loop, so that the thread reading them is
+#     the thread that wrote them. Before it, every loop read the global tables
+#     under one shared lock and the lock was the ceiling: `mutex_lock` per request
+#     `2.03 / 2.04 -> 0.03 / 0.02`, time held `3 679 / 4 171 -> 969 / 1 259` ns,
+#     time waiting `7 761 / 9 368 -> 183 / 239` ns. At `1 / held` the old lock
+#     admits 240 000-270 000 requests a second, which is the order the board's
+#     `static-h2` rows sit at (about 235 000) while the same round's
+#     `json-tls-4096` spends 63.3 cores at a lower per-request cost -- so the
+#     static profiles were short of parallelism, not of work. The local
+#     end-to-end moved `+19.6%` (109 997 -> 131 608 req/s, two interleaved
+#     rounds, server on 9 cores with the generator pinned to the same machine),
+#     which is offered as direction only; the counter and the `1 / held`
+#     arithmetic are the criterion. This is the h1/h2 static handler; the h3 leg
+#     goes through `uvcpp_static_server` and does not take this path.
+#
 # What this run also carries, and what is *not* in the pin, is the entry side:
 # the JSON profiles answer through the framework's standard serializer again
 # (see the `/json` note below). The fifth run measured the size of that change
@@ -81,9 +123,24 @@ ENV DEBIAN_FRONTEND=noninteractive
 # the revision the maintainer then objected to, and it reported `async-db-1024`
 # at `271.85` us of CPU per response against the fourth run's `407.2` -- a fall
 # that the doc attributes to that one entry commit and to nothing in the library.
-# This entry has the DOM path back, so its `async-db` row starts from the higher
-# number, and its `json-*` rows are likewise the ones to compare against the
-# fourth run's rather than the fifth's.
+# This entry has the DOM path back, so its `async-db` and `json-*` rows read
+# against the sixth run's -- the most recent one that also had it back -- and not
+# against the fifth's, whose tree answered through `uvcpp_json_writer`.
+#
+# The other entry-side change since the sixth run is on the h3 static leg, and it
+# is the same shape of omission the JSON one was. `uvcpp_static_server` is a
+# different handler from the `uvcpp_web_app` static code the h1/h2 legs use --
+# `uvcpp_web_app` has no QUIC, so `static-h3-64` has to mount this one -- and
+# options set on one are not inherited by the other. Its `revalidate` had been
+# left on the `POOL` default, so every `static-h3-64` request queued to the libuv
+# thread pool to `stat()` there and came back through `after_work`; the h1/h2
+# legs have been on `LOOP_STAT` since `af3b4fc`. One line sets it here. On this
+# machine's h3 rig, one line apart with everything else equal: `29 434 -> 38 280`
+# req/s and `216.8 -> 193.3` us per request, the two arms' rep ranges not
+# overlapping (29 129-30 454 against 33 855-42 360). The library's section 4.8
+# ran the same A/B on the same handler with `statx` per request as its control,
+# and the control did not move (`2.24` on both arms) -- the mtime and size check
+# still happens on every request, only the thread it happens on changed.
 #
 # The sixth run also turned the framework's brotli encoder on, and this tree turns
 # it back off. That is the one change here that is not a like-for-like restoration
@@ -302,8 +359,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 # to 8 cores, only `Accept-Encoding` swapped: gzip 257 us, `br` 508 us with 72.43
 # minor faults per request -- the encoder's ~700 KB of state being handed back to the
 # kernel between requests and re-faulted in. Removing that churn is a real fix and
-# the library's `master` now carries it (`0aaa415`'s thread-local arena -- it is one
-# commit past this pin, and with brotli off it is a no-op for this entry; raising
+# the library's `master` now carries it (`0aaa415`'s thread-local arena -- with
+# brotli off it is a no-op for this entry, which is why the pin now carrying it
+# changes nothing in these rows; raising
 # `MALLOC_MMAP_THRESHOLD_` and `MALLOC_TRIM_THRESHOLD_` does the same thing from
 # outside, which is what made the cause unambiguous): faults 72.43 -> 0.00, `br`
 # 508 -> 385 us. 385 against gzip's 257 is still 1.5x, and that is the ratio at its
@@ -339,7 +397,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # and this entry is `mode: standard` -- so the framework's own middleware, answering
 # gzip, is what the guide asks for.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
-ARG LIBUVCPP_REF=02ae41806a25112ee7050ccfd4132138b1eb2630
+ARG LIBUVCPP_REF=1f6a8fbf54907ce942eb0963cf9a391bacb1bacd
 
 ARG OPENSSL_VERSION=3.5.0
 

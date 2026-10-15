@@ -18,7 +18,7 @@ release workflow's legs passed `-DUVCPP_ENABLE_DB_MYSQL=OFF
 -DUVCPP_ENABLE_DB_PGSQL=OFF` — the workflow asserts it with an `ldd` check that
 fails if `libpq.so` appears — while `/async-db` needs the Postgres backend. The
 pin has since moved onto development revisions: the `v1.7.0` tag is the nearest
-release, the pin is three commits past it, and a release package exists only for
+release, the pin is twelve commits past it, and a release package exists only for
 a tag, so building the pinned SHA from source is the only way to build exactly
 what the pin names. The `1.7.0` packages do carry both remote backends, behind
 the runtime-load seam that is why the same `ldd` list still passes, so the
