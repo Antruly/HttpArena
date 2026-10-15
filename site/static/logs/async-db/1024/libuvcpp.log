@@ -1,3 +1,1 @@
-libuvcpp: /json fast path: flattened dataset (50 items, 115 tag strings, 1508 B pool + 3600 B items)
 libuvcpp: Postgres pool up (max=256)
-libuvcpp: /async-db answers from the writer path
