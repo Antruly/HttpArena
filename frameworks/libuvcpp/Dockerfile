@@ -165,7 +165,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 # 0.71 segments/frame and 1,014k frames/s.
 #
 # The pin then sat on `perf(json): 写出器的键与字符串值改成一次追加` (c8950ae), the
-# change this entry's `/json` handler was rewritten onto. `uvcpp_json_writer`'s
+# change this entry's `/json` handler was rewritten onto. **The entry no longer
+# uses it.** `uvcpp_json_writer` is an alternative JSON serializer, and the JSON
+# profiles measure serialization, so Standard mode wants the framework's
+# standard serializer: the response is built as an `nlohmann::json` DOM and sent
+# through `resp.json()`. That is a deliberate, measured loss on `json-comp`,
+# `json-tls` and `/async-db` (see the README's `/json` note); the paragraphs
+# below are kept as the record of why the pin moved when it did, not as a
+# description of what this entry does now. `uvcpp_json_writer`'s
 # `key()` used to append the comma, the opening quote, the escaped body, the
 # closing quote and the colon separately -- four or five out-of-line
 # `std::string::append` calls per key, three per string value, 4073 of them on a

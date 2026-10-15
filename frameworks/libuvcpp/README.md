@@ -132,40 +132,36 @@ the profile forbids the framework from doing the JWT verification itself.
   documented static handler. Nothing in the entry reads or caches static bytes
   itself — the handler revalidates each request against the file's size and
   `mtime` (seconds and nanoseconds), so a replaced file is served immediately.
-- **JSON is serialized per request through the framework's own writer.** The body
-  is built by walking the live dataset with `uvcpp_json_writer` — libuvcpp's
-  documented streaming constructor, the one `doc/json-guide.md` describes — and
-  the `total` field is computed inside the loop, from the values the writer is
-  reading. Nothing is pre-serialized, cached, or spliced out of a previously
-  rendered buffer, and the response is byte-for-byte what the previous
-  implementation produced. What moved is what writing it costs: a key now goes
-  out in one `append` instead of four or five, which on this box takes
-  `/json/50?m=6` from 80.4 to 63.2 us of server CPU per request — a repeat run
-  put the same pair at 73.8 and 59.2 us — measured best-of-3 interleaved rounds
-  with the server pinned to 6 single-threaded cores and saturated at 100% of
-  them. With `Accept-Encoding: gzip, br` the pair is 155.0 to
-  141.1 us: compressing the 8.4 KB body costs more than serializing it, so the
-  gain is smaller there, not absent. End to end (h2load, best of 3): 73.7k ->
-  94.2k req/s over h2c and 81.0k -> 96.3k over h1. Against the copy-then-dump
-  shape this handler used before — each item duplicated into a second DOM and
-  the whole payload dumped, still in `main.cc` as `build_json_general`, the
-  fallback for any value the writer cannot reproduce byte-for-byte — the whole
-  path costs 3.0x less CPU per request (176.0 -> 59.2 us).
-  The dataset is now read out of the DOM once at startup into a flat array
-  (`flat_item` plus a single character pool, ~5 KB for all 50 items), so the
-  handler walks that instead of 50 `std::map` trees; the walk it replaces cost
-  about 140 ns per item. That takes the serialization step for `/json/50?m=6`
-  from 31.0 to 23.4 us (9 interleaved rounds in one process, median of the
-  per-round ratios 0.751 / 0.769 / 0.793 over three repeats) and 10.8-11.7% of
-  server CPU per request end to end (11 paired rounds: 0.883 and 0.893 in two
-  runs). Nothing is pre-rendered — every request still walks the live items and
-  writes their bytes. The flattening is not trusted on faith:
-  `build_flat_dataset` writes each item both ways and enables the fast path only
-  if every one matches the reference byte for byte at three multipliers, so a
-  dataset of any other shape stays on the reference path and says which path it
-  is on at startup. Parsing is now the framework's `uvcpp_json_parse` rather
-  than nlohmann's `parse` directly, so every JSON call the entry makes is one
-  the library publishes.
+- **JSON is serialized per request by the framework's standard serializer.**
+  The handler builds an `nlohmann::json` DOM out of the live dataset — the
+  framework's own `uvcpp_json` is nlohmann's `json`, and the response goes out
+  through `resp.json()`, which is the framework's `uvcpp_json_dump()` — and
+  `total` is computed inside the loop, per request. Nothing is pre-serialized,
+  cached, or spliced out of a previously rendered buffer.
+
+  This is deliberate, and it is the one place this entry gives up speed for the
+  rules. The profile's JSON tests exist to measure serialization, Standard mode
+  asks for "the framework standard JSON serialization"
+  (`test-profiles/h1/json-compressed/implementation.md`) and for the
+  ecosystem's production-grade library over a hand-rolled alternative
+  (`implementation-rules/frameworks/standard.md`: "Experimental or hand-rolled
+  alternatives solely for benchmark performance are not permitted"), and
+  `implementation-rules/frameworks/tuned.md` lists "Alternative JSON
+  serializers" among the things *Tuned* allows. `uvcpp_json_writer` — the
+  library's streaming writer, a public and documented API that
+  `doc/json-guide.md` describes — is such an alternative serializer, so this
+  entry does not answer these profiles with it. The same applies to `/async-db`,
+  which used to walk the result rows straight into the writer. Reading is the
+  same rule the other way: `uvcpp_json_parse` and the `uvcpp_json_get_*`
+  accessors rather than nlohmann's `parse` and `value()` directly, so every JSON
+  call the entry makes is one the library publishes — and none of them can throw
+  out of a libuv callback, which is what those accessors exist for.
+- **The cost of that choice, measured.** At the 1.7.2-dev pin this repository
+  was built on, `/json/50?m=6` through the writer cost 63.2 us of server CPU per
+  request against the DOM path's 176.0 us on the same 6 pinned cores, and the
+  writer also skipped the per-item DOM copy the DOM path makes. Both figures are
+  the ones this entry reported in earlier revisions; they are recorded here
+  because the entry no longer collects them.
 - **Compression is the framework's built-in response compression** (gzip and
   brotli), which answers `Accept-Encoding` per request and adds no
   `Content-Encoding` when the client sends none. Both encoders are the library's
@@ -219,27 +215,23 @@ the profile forbids the framework from doing the JWT verification itself.
   between dialects, on purpose — `?` is a legal operator in Postgres for jsonb
   and hstore, so a translation layer could not tell the two apart. This is the
   entry's only Postgres-specific line.
-- **`tags` is walked, not re-parsed.** Postgres returns JSONB as text (OID 3802
+- **`tags` is parsed, not spliced.** Postgres returns JSONB as text (OID 3802
   is not one of the driver's mapped types, and an unmapped OID degrades to the
-  string libpq returned), and that string *is* the JSON array — so it goes into
-  the response as an array rather than as a quoted string. The response is built
-  with the framework's `uvcpp_json_writer`, and for `tags` that means walking the
-  literal and copying the strings it holds, normalising the whitespace Postgres
-  puts after the commas — the bytes `nlohmann::json::parse` followed by `dump()`
-  produced. The walk declines anything it cannot reproduce byte for byte: a
-  number (which `dump()` would re-render from a double), `true`/`false`/`null`, a
-  nested value, a `\"` or `\uXXXX` escape, or a byte outside printable ASCII
-  (where the two serializers may part ways). A decline puts the whole response
-  back on the DOM path, which is also where `parse_tags`' rule for a value that
-  will not parse — an empty array — still lives.
-- **The writer path is proved before it answers.** The first response that
-  carries at least one row is built both ways and the writer's bytes must equal
-  the reference path's before the writer is allowed to answer with them; until
-  then, and after any decline, the reference path answers. One extra DOM build
-  per process, and the server logs which path took over.
+  string libpq returned), and that string *is* the JSON array — so it has to
+  reach the response as an array rather than as a quoted string. `parse_tags`
+  runs `uvcpp_json_parse` over it and puts the array in the DOM, which is then
+  serialized with everything else by `resp.json()`. It used to be walked and
+  copied through instead, which was faster and is what the writer path did; see
+  the `/json` note above for why that is not this entry's call to make.
+- **One serializer, one path.** Every response body this profile serves —
+  including the ones carrying `tags` — is built as an `nlohmann::json` DOM and
+  dumped by the framework. There is no second, hand-written path to prove
+  against the first.
 - **Failure is not fatal and not silent-in-the-wrong-way.** With no
   `DATABASE_URL`, or a pool that will not open, `/async-db` answers the
-  documented `{"items":[],"count":0}` and the other profiles serve normally.
+  documented empty result set — `{"count":0,"items":[]}`, built by the same
+  serializer and in the same key order as a populated one — and the other
+  profiles serve normally.
 - **At the profile's own generator shape the pool saturates without failing.**
   `scripts/lib/tools/gcannon.sh` drives this endpoint with `-r 25`, so each
   socket serves 25 requests and is then retired and replaced; 1024 is how many
