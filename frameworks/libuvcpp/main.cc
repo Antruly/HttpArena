@@ -1457,6 +1457,36 @@ int main() {
   // response on the loop thread -- 933.15 rps against 82,451 with it, on the
   // rig described above kStaticOpts.
   h3_static.set_precompressed(true);
+  // The same cache-validation thread choice the h1/h2 legs get through
+  // kStaticOpts.revalidate, which this leg has no uvcpp_web_static_options to
+  // receive -- and did not get at all until now: uvcpp_static_server defaults
+  // to POOL, so every static-h3 request (a `.br` twin makes it two stats)
+  // queued to the libuv thread pool, woke a worker, stat()ed there and came
+  // back through after_work. LOOP_STAT does the stat where the request already
+  // is. The h1/h2 static legs have been on it since `af3b4fc`.
+  //
+  // Measured on this leg with the entry built twice, one line apart, same
+  // library, same ext4 corpus, the profile's own URIs and Accept-Encoding
+  // (--alpn-list=h3 -c 64 -m 64 -t 8 -D 5s, three reps a side, interleaved;
+  // server on 8 cores, generator on 8 disjoint ones):
+  //
+  //   rps         29 434 -> 38 280  (rep range 29 129-30 454 vs 33 855-42 360;
+  //                                  even the worst `loopstat` rep beats the
+  //                                  best `pool` one)
+  //   us/req         216.8 -> 193.3
+  //
+  // The mechanism is in the library's doc/benchmark.md section 4.8, which ran
+  // the same A/B on the same `uvcpp_static_server`: `futex`/req 6.28 -> 0.66
+  // with `statx`/req 2.24 -> 2.24 as the control -- the mtime/size check that
+  // decides whether the cache is still good still happens on every request,
+  // only the thread it happens on moved. Tail latency improved there too
+  // (p50 63,661 -> 56,896 us, p99 170,526 -> 140,458 us), which is the risk
+  // this option carries and the reason the library default stays POOL: on a
+  // FUSE or network mount one stat() is ~46 us and blocking a loop thread on
+  // it would be the wrong trade. The platform mounts the dataset into the
+  // container, so this leg is on the same local overlayfs the h1/h2 legs are
+  // already doing this on.
+  h3_static.set_revalidate(uvcpp_static_revalidate::LOOP_STAT);
   uvcpp_http_server h3;
   if (have_certs) {
     if (!quic_tls.load_certificate_file(kCertFile) ||
