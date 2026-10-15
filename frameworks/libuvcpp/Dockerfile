@@ -134,9 +134,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 # options set on one are not inherited by the other. Its `revalidate` had been
 # left on the `POOL` default, so every `static-h3-64` request queued to the libuv
 # thread pool to `stat()` there and came back through `after_work`; the h1/h2
-# legs have been on `LOOP_STAT` since `af3b4fc`. One line sets it here. On this
-# machine's h3 rig, one line apart with everything else equal: `29 434 -> 38 280`
-# req/s and `216.8 -> 193.3` us per request, the two arms' rep ranges not
+# legs have been on `LOOP_STAT` since `7095e92` (`af3b4fc` is where this branch
+# got it). One line sets it here. On this machine's h3 rig, one line apart with
+# everything else equal: `29 434 -> 38 280` req/s and `216.8 -> 193.3` us per
+# request, the two arms' rep ranges not
 # overlapping (29 129-30 454 against 33 855-42 360). The library's section 4.8
 # ran the same A/B on the same handler with `statx` per request as its control,
 # and the control did not move (`2.24` on both arms) -- the mtime and size check

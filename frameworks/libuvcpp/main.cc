@@ -1463,7 +1463,7 @@ int main() {
   // to POOL, so every static-h3 request (a `.br` twin makes it two stats)
   // queued to the libuv thread pool, woke a worker, stat()ed there and came
   // back through after_work. LOOP_STAT does the stat where the request already
-  // is. The h1/h2 static legs have been on it since `af3b4fc`.
+  // is. The h1/h2 static legs have been on it since `7095e92`.
   //
   // Measured on this leg with the entry built twice, one line apart, same
   // library, same ext4 corpus, the profile's own URIs and Accept-Encoding
