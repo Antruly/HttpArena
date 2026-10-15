@@ -184,9 +184,9 @@ the profile forbids the framework from doing the JWT verification itself.
   `Accept-Encoding: br;q=1, gzip;q=0.8`, so those 15 go out as the shipped
   brotli file with `Content-Encoding: br` and `Vary: Accept-Encoding`. This is
   the same thing every other entry does — nginx `gzip_static`, Caddy
-  `precompressed br gzip` (which this entry's own edge Caddyfiles already use),
-  actix `try_compressed()` — and the entry neither produces nor caches those
-  files: it is the framework's option, pointed at the dataset as mounted. A
+  `precompressed br gzip`, actix `try_compressed()` — and the entry neither
+  produces nor caches those files: it is the framework's option, pointed at the
+  dataset as mounted. A
   request for a file with no twin, or one that sends no `Accept-Encoding`, or a
   `Range` request, gets the live path unchanged.
 - **The libuv thread pool is sized at the top of `main()`.** Two things ride
@@ -286,20 +286,22 @@ Three things about 8443/udp are worth stating, because they are deliberate:
 ### The compose stacks
 
 `gateway-64`, `gateway-h3` and `production-stack` are orchestrated by
-`compose.<profile>.yml`, all of which run `network_mode: host` and put a stock
-unmodified `caddy:2-alpine` at the edge. There is no hand-written proxy in this
-entry: the gateway profiles' rules exclude one ("No custom proxy
-implementations"), and a Caddyfile that says `file_server` and `reverse_proxy`
-is the whole of it.
+`compose.<profile>.yml`, all of which run `network_mode: host` and put a stock,
+unmodified reverse proxy at the edge: `nginx:1.27-alpine` for `gateway-64` and
+`production-stack`, `caddy:2-alpine` for `gateway-h3`. There is no hand-written
+proxy in this entry: the gateway profiles' rules exclude one ("No custom proxy
+implementations"), and a `nginx.conf` or `Caddyfile` that says `file_server` and
+`reverse_proxy` is the whole of it.
 
-| Profile | Compose file | Services |
-|---|---|---|
-| `gateway-64` | `compose.gateway.yml` | proxy + server |
-| `gateway-h3` | `compose.gateway-h3.yml` | proxy + server |
-| `production-stack` | `compose.production-stack.yml` | edge + cache + authsvc + server |
+| Profile | Compose file | Edge | Services |
+|---|---|---|---|
+| `gateway-64` | `compose.gateway.yml` | `nginx:1.27-alpine` | proxy + server |
+| `gateway-h3` | `compose.gateway-h3.yml` | `caddy:2-alpine` | proxy + server |
+| `production-stack` | `compose.production-stack.yml` | `nginx:1.27-alpine` | edge + cache + authsvc + server |
 
-- **The edge serves `/static/*` off the mounted disk itself**, with
-  `file_server { precompressed br gzip }` — never forwarded to the backend. That
+- **The edge serves `/static/*` off the mounted disk itself** — Caddy's
+  `file_server { precompressed br gzip }`, or for the nginx edges an `alias`
+  plus `gzip_static on` — never forwarded to the backend. That
   is what the gateway rules require and what the profile measures: a front door
   doing TLS, compression and file I/O in front of an application server that
   answers only the dynamic endpoints.
@@ -308,16 +310,52 @@ is the whole of it.
   the server's per-core loops through a pool of h1 keepalive connections; a
   single h2 connection to the backend would re-serialize them behind one
   connection's flow control.
-- **The same Caddyfile covers gateway-64 and gateway-h3.** `protocols h1 h2 h3`
-  binds 8443 on tcp and udp from one server block; only the load generator
-  differs (`h2load --alpn-list=h3`).
+- **The gateway and production edges are nginx; only the h3 stack is Caddy.**
+  `gateway-64` drives 512 connections × 32 streams = 16,384 concurrent requests,
+  and over the profile's HTTP/1.1 upstream hop that multiplexing is what the
+  edge costs. Caddy charges roughly 3× nginx per request there — 372–404 µs/req
+  for the three entries whose `gateway-64-512` edge is Caddy against 100–110 for
+  the three whose edge is nginx — which put the proxy at 96% of its 32 CPUs
+  while the server sat at 23% of its own. The same holds on `production-stack`,
+  where the edge also runs `auth_request` per `/api/*` call: measured at the
+  profile's own 256 reads + 32 writes over a four-core stand-in, Caddy's edge
+  cost 440 µs/req at 8.4k req/s and 392 µs/req at 9.5k once its unconfigured
+  `forward_auth` upstream was given a connection pool, against 101 µs/req at
+  39.2k for nginx in the same shape, with the edge pinned at its core budget in
+  all three arms. `proxy/nginx.conf` and `proxy-production/nginx.conf` carry the
+  measurements. The profile lists "proxy choice" among the things entries
+  compete on, its own example compose uses nginx, and `production-stack`'s
+  architecture diagram names nginx and `auth_request` — so both are nginx. The
+  h3 profile cannot follow: h3 needs QUIC, and nginx has no HTTP/3 without a
+  custom build against a QUIC library, so `gateway-h3` keeps Caddy from
+  `proxy-h3/` and lives in its own compose file rather than sharing one
+  Caddyfile with `gateway-64` as it used to.
+- **`worker_processes` in both nginx configs is a literal, coupled to the
+  compose `cpuset`.** nginx's `worker_processes auto` counts the *host's* online
+  CPUs, ignoring a container cpuset, and `worker_cpu_affinity auto` is worse: it
+  re-pins each worker to a CPU of its own choosing and leaves the cpuset
+  entirely. The shipped values are 32 for `proxy/nginx.conf`, matching
+  `PROXY_CPUSET`'s default of `0-15,64-79`, and 30 for
+  `proxy-production/nginx.conf`, matching `EDGE_CPUSET`'s `0-14,64-78`; change a
+  cpuset and its number has to change with it.
+- **The nginx edges serve the gzip twin of a static asset, not the brotli
+  one.** The framework's own static legs pick brotli, but the gateway and
+  production edges are a stock `nginx:1.27-alpine` and brotli needs
+  `nginx-mod-http-brotli`, which cannot be loaded into the official image's
+  nginx (nginx checks the build signature, so the module has to come from the
+  same build as the binary). Serving brotli from a distribution's nginx plus its
+  module package was measured on the rig at the gateway profile's concurrency —
+  47,275 B of `app.js` against gzip's 54,813, medians of nine runs — and the two
+  came out within the rig's own run-to-run spread, so they serve the `.gz`
+  sibling like the profile's other nginx edges do. Both encodings are announced
+  in `Vary: Accept-Encoding`.
 - **The server is not given `/certs`.** `main.cc` opens its 8081 and 8443
   listeners only when the certificate pair is readable, so with none mounted it
   comes up on its two cleartext ports and leaves every TLS port to the edge.
   Mount the certificates into both services and the two race for 8443.
 - **The backend's ports are 8085/8086, not 8080/8082.** Both ends of the hop are
   set together — `H1_PORT`/`H2C_PORT` in the compose `server`'s environment and
-  the upstream in the Caddyfile. The stack runs on the host network, and 8080
+  the upstream in the edge's config. The stack runs on the host network, and 8080
   and 8082 are exactly the two ports something else can already be holding
   there, so the backend is given ports of its own rather than racing for the
   entry's defaults. 8080 is still opened, but as the readiness probe's landing
@@ -327,11 +365,15 @@ is the whole of it.
   one idle loop.
 - **`production-stack`'s JWT verification is the shared sidecar, unmodified** —
   `frameworks/_shared/authsvc/`, built from the same directory every entry uses.
-  The edge fires `forward_auth` at it for every `/api/*` request and copies back
-  the `X-User-Id` it resolves; the token cost is not cached, because that cost is
-  part of what the profile measures. The server never parses a token, never reads
-  `Authorization`, and separately returns 401 for any `/api/*` request that
-  arrives with no `X-User-Id` at all.
+  The edge fires an auth subrequest at it for every `/api/*` request (`auth_request`
+  for nginx, `forward_auth` for Caddy) and copies back the `X-User-Id` it
+  resolves; the token cost is not cached, because that cost is part of what the
+  profile measures. The server never parses a token and separately returns 401
+  for any `/api/*` request that arrives with no `X-User-Id` at all. The nginx
+  edge additionally drops the `Authorization` header before forwarding, so the
+  token cannot be re-verified downstream; Caddy's `forward_auth` passes it
+  through — checked against a header-dumping backend rather than assumed — which
+  is not a violation either, just the looser reading.
 - **Cache-aside is in-process.** The profile's implementation guide lists
   "in-process only: no Redis for caching, just a local hashmap with TTL" beside
   the L1+L2 and Redis-only options, and this entry takes it: the profile runs one

@@ -1,11 +1,14 @@
 # gateway-h3 — the same two-service stack as compose.gateway.yml, exercised
 # over HTTP/3 at the edge.
 #
-# Nothing about the stack changes: stock Caddy binds 8443 on both tcp and udp
-# from the same `protocols h1 h2 h3` server block, so the proxy config is
-# byte-identical and only the load generator differs (h2load with
-# `--alpn-list=h3`). The upstream hop stays plain h1 over loopback, which is
-# what the server speaks.
+# Same shape, same backend, same upstream hop (plain h1 over loopback), and a
+# different edge *image*: this one is stock Caddy from ./proxy-h3, where
+# gateway-64 is stock nginx from ./proxy. The split exists because h3 needs
+# QUIC and nginx has no HTTP/3 without a custom build against a QUIC library,
+# while over the profile's h1 upstream hop Caddy costs ~3x nginx per request at
+# gateway-64's multiplexing -- so the two profiles want different edges. Caddy
+# binds 8443 on both tcp and udp from its `protocols h1 h2 h3` server block,
+# and the h3 load generator reaches the udp half (h2load with `--alpn-list=h3`).
 #
 # Kept as a separate file rather than a symlink because the harness resolves
 # compose files by name (`compose.<profile>.yml`, with gateway-64 on the legacy
@@ -21,7 +24,7 @@
 services:
   proxy:
     build:
-      context: ./proxy
+      context: ./proxy-h3
     network_mode: host
     cpuset: "${PROXY_CPUSET:-0-15,64-79}"
     ulimits:

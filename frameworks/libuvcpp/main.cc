@@ -183,9 +183,9 @@ const char* kStaticRoot = "/data/static";
 ///
 /// It is also what every other entry in this arena does -- nginx `gzip_static`,
 /// Caddy `precompressed br gzip`, actix `try_compressed()` -- and what this
-/// entry's own `proxy/Caddyfile` and `proxy-production/Caddyfile` already ask
-/// their edges for. Left off, the direct legs would be the only place in the
-/// whole entry serving a live deflate.
+/// entry's own `proxy/nginx.conf`, `proxy-production/nginx.conf` and
+/// `proxy-h3/Caddyfile` already ask their edges for. Left off, the direct legs
+/// would be the only place in the whole entry serving a live deflate.
 ///
 /// Off by default in `uvcpp_web_static_options`, so it has to be turned on
 /// explicitly. `:8443/udp` (static-h3) is a `uvcpp_http_server` +

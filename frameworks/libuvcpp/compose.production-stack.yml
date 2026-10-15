@@ -1,7 +1,7 @@
 # production-stack — edge + cache + authsvc + server, four services on a 64
 # logical CPU budget.
 #
-#   edge     (caddy)     30 logical CPUs. TLS + h2 termination, /static served
+#   edge     (nginx)     30 logical CPUs. TLS + h2 termination, /static served
 #                        off disk, one auth subrequest per /api/* call.
 #   cache    (redis)      2. Redis is single-threaded on the data path; a
 #                        second core would sit idle.
@@ -13,6 +13,13 @@
 #
 # All four on host networking, so what passes between them is loopback: the
 # edge owns 8443, authsvc 9090, the server 8085, the cache 6379.
+#
+# The edge is nginx rather than the Caddy this stack used before. The profile's
+# own architecture diagram names nginx and `auth_request`, and on a 4-core
+# stand-in for this shape Caddy's edge cost 392-440 us of CPU per request
+# against nginx's 101, with the edge pinned at its core budget in every arm.
+# proxy-production/nginx.conf carries the measurement. Nothing here is h3, so
+# unlike the gateway pair this stack does not need a Caddy twin.
 #
 # The server is not given /certs, for the same reason as the gateway stacks --
 # main.cc opens its TLS listeners only when the certificate pair is readable, so

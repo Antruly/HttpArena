@@ -1,9 +1,15 @@
-# gateway-64 — stock Caddy (TLS + h2 on 8443) in front of the libuvcpp server.
+# gateway-64 — stock nginx (TLS + h2 on 8443) in front of the libuvcpp server.
 #
 # Two services, which is what the profile fixes: `proxy` terminates TLS, serves
 # /static/* off disk and forwards the dynamic endpoints over plain h1 to
 # 127.0.0.1:8085; `server` answers /baseline2, /json/{n} and /async-db and
 # nothing else.
+#
+# The edge is nginx rather than the Caddy that gateway-h3 still uses, because at
+# this profile's 512 connections x 32 streams Caddy costs ~3x nginx per request
+# over an h1 upstream and the proxy was therefore the stack's bottleneck (96% of
+# its 32 CPUs against the server's 23%). proxy/nginx.conf has the measurement.
+# The h3 profile cannot follow: h3 needs QUIC, which nginx lacks.
 #
 # The server is deliberately **not** given /certs. main.cc opens its 8081 and
 # 8443 listeners only when the certificate pair is readable, so with no certs
