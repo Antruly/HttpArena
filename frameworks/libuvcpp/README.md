@@ -166,11 +166,18 @@ the profile forbids the framework from doing the JWT verification itself.
   is on at startup. Parsing is now the framework's `uvcpp_json_parse` rather
   than nlohmann's `parse` directly, so every JSON call the entry makes is one
   the library publishes.
-- **Compression is the framework's built-in response compression** (gzip), which
-  answers `Accept-Encoding` per request and adds no `Content-Encoding` when the
-  client sends none. The library has no brotli compressor, so an `Accept-Encoding:
-  br, gzip` request is answered with gzip for anything the handler compresses
-  live.
+- **Compression is the framework's built-in response compression** (gzip and
+  brotli), which answers `Accept-Encoding` per request and adds no
+  `Content-Encoding` when the client sends none. Both encoders are the library's
+  own middleware at its own defaults; the build turns the brotli one on
+  (`-DUVCPP_ENABLE_BROTLI=ON` in the Dockerfile) because it is the library's
+  default quality that the header records as the maximum of its own score model
+  for this profile. `json-compressed` asks for it — its guide lists the
+  framework's built-in compression under `standard=`, its title names brotli, and
+  its request carries `Accept-Encoding: gzip, br`, where equal `q` resolves to
+  `br`. On the three json-comp bodies the encoder produces 856/1182/1389 B
+  against gzip's 970/1330/1567 B. `Accept-Encoding` is still honoured per
+  request, so a client that asks for gzip alone still gets gzip.
 - **Where the dataset ships a pre-compressed twin, the handler serves it**
   (`precompressed`, on for every static leg). 15 of the dataset's 20 assets carry
   a `.br` and a `.gz` beside them, and the static profiles send

@@ -223,9 +223,30 @@ ENV DEBIAN_FRONTEND=noninteractive
 # LRU and stops copying the whole body on a hit; an h1 pipeline's final
 # `Connection: close` no longer takes the earlier responses with it; and the h2
 # outbound body is held by reference rather than copied per response. Two optional
-# modules arrive in the same range and both default to OFF -- a yyjson parse
-# backend and a brotli encoder -- so the platform's flag set above builds neither
-# and the binary this Dockerfile produces is unaffected by them.
+# modules arrive in the same range and both default to OFF. A yyjson parse backend
+# is one of them and stays off, so the flag set above builds it out. The brotli
+# encoder is the other, and it is the one optional module this entry turns on.
+#
+# Why brotli is on. It is not a tuning knob -- it is the framework's own response
+# compression middleware, reached only when the client asks for `br`, at the
+# framework's own default quality (`k_brotli_quality_default`, which the header
+# records as the maximum of its own score model). The profile that asks for it is
+# `json-compressed`, whose guide puts "the framework or engine's built-in response
+# compression" under `standard=`, names brotli in its own title, and whose request
+# carries `Accept-Encoding: gzip, br`; equal `q` resolves to `br` by the rank rule in
+# `web/uvcpp_http_compress.cpp`. Measured on the three json-comp bodies -- same
+# entry binary, only the `.so` swapped -- gzip gives 970/1330/1567 B and `br` gives
+# 856/1182/1389 B, which is the encoder's own table in `web/uvcpp_http_compress.h`.
+# The cost lands where the profile pays for it: json-comp is the only profile scored
+# on bytes (`rps * (minBpr/bpr)^2`) and it runs at 101% of its CPU budget, so ~+31.5
+# us per response buys ~11% fewer bytes -- about x1.07 on both json-comp profiles,
+# net of the requests per second that the extra CPU costs. The profiles that merely
+# pass `br` through -- gateway-64 at 58% of budget, gateway-h3 at 58%,
+# production-stack at 49% -- have the CPU headroom to absorb the same compression and
+# collect the smaller bodies for free. `json-tls`, `json-h2c`, `async-db` and the h1
+# baseline profiles send no `Accept-Encoding` at all, and the static legs already
+# serve the `.br` twins shipped in `data/static` whether or not this flag is set: that
+# selection is runtime, in `http_pick_precompressed_variants()`.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
 ARG LIBUVCPP_REF=81507207a4ad496a66019a40e3993dcf34ba275f
 
@@ -253,9 +274,16 @@ ARG OPENSSL_VERSION=3.5.0
 # file or directory`. Confirmed against this pin rather than assumed: `g++ -H`
 # resolves `<zlib.h>` to `<prefix>/include/zlib.h`, and it keeps resolving there
 # with the package gone, since `-I` is searched before the system directories.
+# `libbrotli-dev` is here for `-DUVCPP_ENABLE_BROTLI=ON` below, and only the build
+# stage needs it: the library uses `<brotli/encode.h>` inside one `.cpp`, so no
+# installed public header reaches for it and the consumer below compiles against
+# `/opt/uvcpp/include` without it. The CMake side takes the system copy through
+# pkg-config (`libbrotlienc` / `libbrotlidec`) and falls back to `find_path` /
+# `find_library`, so this is the package that keeps the encoder out of the
+# FetchContent branch -- which would otherwise clone brotli at build time.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        ca-certificates cmake curl g++ git libpq-dev make ninja-build \
+        ca-certificates cmake curl g++ git libbrotli-dev libpq-dev make ninja-build \
  && rm -rf /var/lib/apt/lists/*
 
 # OpenSSL with the QUIC API: static, PIC, no test suite.
@@ -311,6 +339,7 @@ RUN cmake -S . -B build -G Ninja \
         -DUVCPP_BUILD_WEB=ON \
         -DUVCPP_BUILD_WEBAPP=ON \
         -DUVCPP_ENABLE_ZLIB=ON \
+        -DUVCPP_ENABLE_BROTLI=ON \
         -DUVCPP_ENABLE_OPENSSL=ON \
         -DUVCPP_ENABLE_NGHTTP2=ON \
         -DUVCPP_ENABLE_QUIC=ON \
@@ -339,14 +368,24 @@ RUN g++ -std=c++11 -O2 -DNDEBUG -o /server main.cc \
 
 FROM ubuntu:24.04
 
-# libstdc++ for the entry's own objects, libpq5 for the one shared library the
-# build above could not absorb. apt pulls in libpq's transitive closure
+# libstdc++ for the entry's own objects, libpq5 and libbrotli1 for the two shared
+# libraries the build above could not absorb. `libbrotli1` is the second of those:
+# unlike zlib and libuv, which the project fetches and links statically,
+# `UVCPP_ENABLE_BROTLI` takes the system copy, so `libuvcpp.so` carries
+# `libbrotlienc.so.1` and `libbrotlidec.so.1` in its `DT_NEEDED` and the server does
+# not start without them. On noble they are both files of that one package -- the
+# name is not `libbrotlienc1`, which exists on Debian but not here (`libbrotli-dev`
+# itself depends on `libbrotli1`, so the build stage already pulls it in; the
+# runtime stage needs it said out loud).
+#
+# apt pulls in libpq's transitive closure
 # (libgssapi, libldap, libgnutls, libssl3t64, ...) on its own -- that OpenSSL
 # 3.0 is libpq's, and it is a different copy from the 3.5 the library carries
 # statically. Both live in the process; only libuvcpp.so's copy serves the h2
 # and h3 listeners.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libstdc++6 libpq5 \
+ && apt-get install -y --no-install-recommends \
+        libbrotli1 libpq5 libstdc++6 \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/uvcpp/lib/libuvcpp.so /opt/uvcpp/lib/libuvcpp.so
