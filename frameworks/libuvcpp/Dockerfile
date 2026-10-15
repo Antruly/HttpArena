@@ -37,31 +37,78 @@ ENV DEBIAN_FRONTEND=noninteractive
 # and the bytes under it re-uploaded, so a SHA is the only thing that fixes
 # which revision gets built. `3fdd6208` was `v1.6.1` -- what the first version
 # of this entry built, and what the platform measured as the board's 58 req/s on
-# `baseline-h3-64`. The pin has since moved three times: to `2d5fe74`
+# `baseline-h3-64`. The pin has since moved four times: to `2d5fe74`
 # (`1.6.20-dev`), then to `6eede33` (`1.6.51-dev`), which was the tip of the
 # library's `master` when it was taken and is the revision the platform's fourth
-# run measured, and now to `8150720` (`1.7.2-dev`), which is the `v1.7.0` tag
-# plus one documentation commit and two that change code.
+# run measured, then to `8150720` (`1.7.2-dev`), which is the `v1.7.0` tag plus
+# one documentation commit and two that change code, and now to `02ae418`
+# (`1.7.2-dev`), which is four code commits past it.
 # Each move was measured against the previous pin before being taken; the
 # criteria for the `6eede33` batch are further down this file, and each commit's
 # own criterion is in the library's `CHANGELOG.md`.
 #
-# The `8150720` move is the one batch here whose criterion is *not* an on-board
-# measurement. Both commits carry a local deterministic counter as their
-# criterion -- `ebeaa20` is `-1.90%` user-mode instructions per request on the
-# h1 shape (22,459.6 -> 22,032.4 Ir, callgrind, the path normalisation
-# collapsing to one function with a fast path for the already-normal form), and
-# `8150720` is `204.78 -> 102.77` `malloc`s per response on the async-db shape
-# (the result-set vectors now reserve, which `PQntuples`/`PQnfields` let them do
-# exactly). Neither is offered as a predicted board movement. The h1 profiles
+# The `02ae418` move is for the next run, and like the `8150720` move it is a
+# batch whose members carry local deterministic counters rather than on-board
+# measurements. The four code commits between the two pins -- the other two are
+# documentation -- and what each one's criterion is:
+#
+#   * `e716010` stops the database path from building a log line when no log
+#     callback is installed: `106.16 / 106.15 -> 102.18 / 102.22` allocations
+#     per response (A B B A), with `utime + stime` unmoved -- 3.96 allocations
+#     is about 0.12 us, under the rig's resolution, so the allocation count is
+#     the criterion. `async-db` is Reference-only and contributes nothing to
+#     the score; this one is a counter and nothing more.
+#   * `3cbfc9a` and `370d6ef` are the QUIC send path. The first lets one
+#     datagram carry STREAM frames from several streams (`sendmsg` per request
+#     `1.0316 / 1.0360 -> 0.0428 / 0.0561`), the second sizes each send chunk
+#     from what that write needs instead of reserving 64 KiB flat (`72 374.8 ->
+#     7 507.5` bytes allocated per request, `-89.6%`, peak RSS 91 -> 50 MiB on
+#     the local h3 rig, where the flat reserve is the same shape as the 238 MiB
+#     the board reports for `baseline-h3-64`). Both are measured on the h3
+#     profiles this entry subscribes to, on this machine's rig rather than the
+#     board's, and are not offered as predictions.
+#   * `02ae418` lets `resp.json()` hand the dumped body to the response instead
+#     of copying it: `-1.0000` `memcpy` per request and `-8 397` bytes copied
+#     per request -- the body's own length, so it is that copy and not some
+#     other one -- with `-0.83%` instructions per request on `/json/50?m=6`.
+#     The instruction figure is 0.83% of one handler, smaller than the spread
+#     between two board readings; the counters are the criterion.
+#
+# What this run also carries, and what is *not* in the pin, is the entry side:
+# the JSON profiles answer through the framework's standard serializer again
+# (see the `/json` note below), and the brotli encoder is built on. The first of
+# those is the larger effect, and the fifth run measured its size for us by
+# accident: that run's tree had the entry on `uvcpp_json_writer` (9257623), the
+# revision the maintainer then objected to, and it reported `async-db-1024` at
+# `271.85` us of CPU per response against the fourth run's `407.2` -- a fall that
+# the doc attributes to that one entry commit and to nothing in the library.
+# This entry has the DOM path back, so its `async-db` row starts from the higher
+# number, and its `json-*` rows are likewise the ones to compare against the
+# fourth run's rather than the fifth's. Brotli works the other way, on a profile
+# whose score is quadratic in bytes per response (see the note above
+# `ARG LIBUVCPP_REF`).
+#
+# The `8150720` move, like the `02ae418` one above and for the same reason, is a
+# batch whose criterion is *not* an on-board measurement. Its two commits carry
+# a local deterministic counter as their criterion -- `ebeaa20` is `-1.90%`
+# user-mode instructions per request on the h1 shape (22,459.6 -> 22,032.4 Ir,
+# callgrind, the path normalisation collapsing to one function with a fast path
+# for the already-normal form), and `8150720` is `204.78 -> 102.77` `malloc`s per
+# response on the async-db shape (the result-set vectors now reserve, which
+# `PQntuples`/`PQnfields` let them do exactly). Neither is offered as a predicted
+# board movement. The h1 profiles
 # are all `pipeline = 1`, so `-1.90%` of user-mode instructions is about `0.35%`
 # of the end-to-end time on those profiles, which is smaller than the spread
 # between two platform readings of the same profile; and `async-db` is
 # Reference-only, contributing nothing to the board's score and showing up only
 # in its own `cpu_per_req_us`, which is user plus system time where the change
 # is on the user side. So both are accounted for as "the counter certainly went
-# down", not as a score, and what this revision is for is the fifth run, whose
-# numbers will say whether either is visible from outside. The library-side
+# down", not as a score. The fifth run has since reported on them, and neither is
+# separable in it: that round's rps carried an upward bias of up to 3.2% even on
+# the profiles pinned by external factors, where the paragraph above puts
+# `ebeaa20`'s `-1.90%` of user-mode instructions at about 0.35% of end-to-end
+# time; and `async-db` is one row per round, where that same round's entry-side
+# change moved the number by 135 us. The library-side
 # criteria and the guards (byte-identical response bodies, the postgres suite
 # byte-identical across arms, 127/127 ctest) are in its `CHANGELOG.md`.
 #
@@ -255,7 +302,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # serve the `.br` twins shipped in `data/static` whether or not this flag is set: that
 # selection is runtime, in `http_pick_precompressed_variants()`.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
-ARG LIBUVCPP_REF=81507207a4ad496a66019a40e3993dcf34ba275f
+ARG LIBUVCPP_REF=02ae41806a25112ee7050ccfd4132138b1eb2630
 
 ARG OPENSSL_VERSION=3.5.0
 
