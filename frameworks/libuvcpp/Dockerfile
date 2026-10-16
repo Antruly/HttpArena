@@ -37,14 +37,16 @@ ENV DEBIAN_FRONTEND=noninteractive
 # and the bytes under it re-uploaded, so a SHA is the only thing that fixes
 # which revision gets built. `3fdd6208` was `v1.6.1` -- what the first version
 # of this entry built, and what the platform measured as the board's 58 req/s on
-# `baseline-h3-64`. The pin has since moved five times: to `2d5fe74`
+# `baseline-h3-64`. The pin has since moved six times: to `2d5fe74`
 # (`1.6.20-dev`), then to `6eede33` (`1.6.51-dev`), which was the tip of the
 # library's `master` when it was taken and is the revision the platform's fourth
 # run measured, then to `8150720` (`1.7.2-dev`), which is the `v1.7.0` tag plus
 # one documentation commit and two that change code, then to `02ae418`
 # (`1.7.2-dev`), which is four code commits past it and is what the sixth run
-# carried, and now to `1f6a8fb` (`1.7.2-dev`), which is two code commits and a
-# documentation commit past `02ae418` and was the tip of the library's `master`
+# carried, then to `1f6a8fb` (`1.7.2-dev`), which is two code commits and a
+# documentation commit past `02ae418` and is what the seventh run carried, and
+# now to `0f34937` (`1.7.2-dev`), which is two code commits and four
+# documentation commits past `1f6a8fb` and is the tip of the library's `master`
 # when it was taken.
 # Each move was measured against the previous pin before being taken; the
 # criteria for the `6eede33` batch are further down this file, and each commit's
@@ -115,6 +117,56 @@ ENV DEBIAN_FRONTEND=noninteractive
 #     which is offered as direction only; the counter and the `1 / held`
 #     arithmetic are the criterion. This is the h1/h2 static handler; the h3 leg
 #     goes through `uvcpp_static_server` and does not take this path.
+#
+# The `0f34937` move is for the next run: two code commits and four documentation
+# ones past `1f6a8fb`. One of the two does touch a public header -- `239fef0`
+# changes the layout of `uvcpp_malloc_block_cache` in `uvcpp_alloc.h`, keeping
+# its interface -- but this entry does not include that header (it is reached
+# only from `uvcpp_buf.cpp` and `uvcpp_write.cpp`), so no entry change is needed
+# and this build gets both sides of it from the same revision. Both commits are
+# aimed at regressions the seventh run reported, and both carry a local
+# deterministic counter as their criterion.
+#
+#   * `239fef0` moves the free list of the buffer allocator's own blocks out of
+#     the blocks and into per-thread tables. The family serves 1-7 byte blocks --
+#     a WebSocket frame header is two bytes and `echo-ws`'s payload is `"hello"`
+#     -- and the old scheme wrote the "next block" pointer into the block's first
+#     8 bytes, so a block below that size could never go on the list: `put()`
+#     freed it in place and `try_take()` could never hit. Four blocks per
+#     WebSocket echo message went to `malloc` every time (3 x 5 bytes + 1 x 7
+#     bytes, measured at the call site) and none of them was ever reused. On the
+#     local rig, message-allocations per message `11.255 -> 6.255` at `PIPE=1`
+#     and `3.692 -> 0.567` at `PIPE=16` (A B B A, the same entry binary with only
+#     the `.so` swapped, zero spread within a group), and `0.775 -> 0.730` us per
+#     message end to end with `PIPE=16` (`-5.8%`, 255 891 -> 267 986 msg/s).
+#     `echo-ws-pipeline-4096` is the profile it is aimed at: the seventh run put
+#     it at `29 440 675` req/s and `2.31` us of CPU per message, `-6.8%` in rate
+#     and `+13.8%` in CPU per request against the sixth run -- the largest
+#     single-profile regression in that round -- and its 5-byte payload means
+#     none of that cost can be amortised over bytes, so per-message overhead is
+#     the whole story.
+#   * `2872c20` gives the TCP read buffer a per-thread table of exact-size slots.
+#     libuv's `suggested_size` for a TCP stream is 64 KiB flat, so on the
+#     `pipeline = 1` profiles, where one read event is one request, every request
+#     costs a 64 KiB `malloc`/`free` pair. The pair is cheap by itself; what is
+#     not is dragging the large-bin `unlink_chunk` and the fastbin-consolidation
+#     scan into the hot path on profiles that already allocate heavily per
+#     response. callgrind on this entry, same URL, same binary: `/json/50?m=6`
+#     `4 550 109 494 -> 3 796 143 977` instructions (`-16.57%`, with `_int_malloc`
+#     12.01% -> 4.86% and `malloc_consolidate` 4.72% -> 0.02%), `/baseline11`
+#     `-1.36%`. End to end on the local rig, same entry binary with only the
+#     `.so` swapped: `-14.1%` on `/json/50?m=6`, `-8.9%` on the h2c leg, and
+#     `baseline11` **neutral** (`11.40 -> 11.60` us, inside the spread).
+#
+#     (The two ends of this one are worth stating together, because the json
+#     profiles are where the mandated `nlohmann` DOM costs the most and this is
+#     the only lever left on them: the change cannot touch the serialisation the
+#     profile measures, only the allocator traffic underneath it.)
+#
+# Neither is offered as a predicted board movement. On the h1 profiles the
+# `-16.57%` of instructions is one handler's user-mode share of an end-to-end
+# cost that those profiles spend mostly elsewhere, and the `-14.1%` and `-5.8%`
+# figures are this machine's rig, not the board's.
 #
 # What this run also carries, and what is *not* in the pin, is the entry side:
 # the JSON profiles answer through the framework's standard serializer again
@@ -398,7 +450,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # and this entry is `mode: standard` -- so the framework's own middleware, answering
 # gzip, is what the guide asks for.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
-ARG LIBUVCPP_REF=1f6a8fbf54907ce942eb0963cf9a391bacb1bacd
+ARG LIBUVCPP_REF=0f34937fc68e34fc0309dcbc6c539ef5393b36d1
 
 ARG OPENSSL_VERSION=3.5.0
 
