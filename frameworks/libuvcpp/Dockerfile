@@ -159,9 +159,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 #     `baseline11` **neutral** (`11.40 -> 11.60` us, inside the spread).
 #
 #     (The two ends of this one are worth stating together, because the json
-#     profiles are where the mandated `nlohmann` DOM costs the most and this is
-#     the only lever left on them: the change cannot touch the serialisation the
-#     profile measures, only the allocator traffic underneath it.)
+#     profiles are where the `nlohmann` DOM the entry answered with at the time
+#     costs the most and this is the only lever left on them: the change cannot
+#     touch the serialisation the profile measures, only the allocator traffic
+#     underneath it.)
 #
 # Neither is offered as a predicted board movement. On the h1 profiles the
 # `-16.57%` of instructions is one handler's user-mode share of an end-to-end
@@ -178,6 +179,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 # This entry has the DOM path back, so its `async-db` and `json-*` rows read
 # against the sixth run's -- the most recent one that also had it back -- and not
 # against the fifth's, whose tree answered through `uvcpp_json_writer`.
+#
+# The pin this file now names carries the entry side one step further, and its
+# `json-*` and `async-db` rows are *not* like-for-like with that run's either:
+# both handlers build their bodies with the library's yyjson backend instead of
+# the `nlohmann` DOM, so the serializer is a second variable on those rows
+# alongside whatever the pin itself moved. That change is argued in full at the
+# end of the pin block below, criterion first.
 #
 # The other entry-side change since the sixth run is on the h3 static leg, and it
 # is the same shape of omission the JSON one was. `uvcpp_static_server` is a
@@ -327,13 +335,17 @@ ENV DEBIAN_FRONTEND=noninteractive
 #
 # The pin then sat on `perf(json): 写出器的键与字符串值改成一次追加` (c8950ae), the
 # change this entry's `/json` handler was rewritten onto. **The entry no longer
-# uses it.** `uvcpp_json_writer` is an alternative JSON serializer, and the JSON
-# profiles measure serialization, so Standard mode wants the framework's
-# standard serializer: the response is built as an `nlohmann::json` DOM and sent
-# through `resp.json()`. That is a deliberate, measured loss on `json-comp`,
-# `json-tls` and `/async-db` (see the README's `/json` note); the paragraphs
-# below are kept as the record of why the pin moved when it did, not as a
-# description of what this entry does now. `uvcpp_json_writer`'s
+# uses it.** `uvcpp_json_writer` is an alternative JSON serializer -- the rule
+# that lists "Alternative JSON serializers" under Tuned is `tuned.md`, and this
+# entry is `mode: standard` -- so these profiles are answered by the framework's
+# own JSON backend instead: an `nlohmann::json` DOM through `resp.json()` at the
+# pin this paragraph was written at, and a `uvcpp_json_builder` tree written by
+# `uvcpp_json_write` since the pin moved to `134f34d`. Both are the framework's
+# backend, and the cost of not answering through the streaming writer is on
+# `json-comp`, `json-tls` and `/async-db` -- the README's `/json` note is where
+# that is recorded. The paragraphs below are kept as the record of why the pin
+# moved when it did, not as a description of what this entry does now.
+# `uvcpp_json_writer`'s
 # `key()` used to append the comma, the opening quote, the escaped body, the
 # closing quote and the colon separately -- four or five out-of-line
 # `std::string::append` calls per key, three per string value, 4073 of them on a
@@ -391,8 +403,57 @@ ENV DEBIAN_FRONTEND=noninteractive
 # LRU and stops copying the whole body on a hit; an h1 pipeline's final
 # `Connection: close` no longer takes the earlier responses with it; and the h2
 # outbound body is held by reference rather than copied per response. Two optional
-# modules arrive in the same range and both default to OFF -- a yyjson parse backend
-# and a brotli encoder -- and neither is in the flag set above.
+# modules arrive in the same range and both default to OFF -- a yyjson backend and
+# a brotli encoder. Of the two, the yyjson one is now on in the flag set above,
+# and the next paragraph is why; brotli stays off two paragraphs further down.
+#
+# `UVCPP_ENABLE_YYJSON`. The pin moves to `134f34d`, the tip of the library's
+# `master` when it was taken. Three things are in that range. `a063645` gives the
+# JSON backend a construction side and yyjson's own serializer, and that is what
+# `/json` and `/async-db` answer through now -- it is the reason for this move.
+# `638512b` takes three copies off the h1 dynamic hot path (`-11.03%` user-mode
+# instructions per request on the library's own callgrind rig, which the commit
+# sizes at `-3` to `-4%` end to end and does not claim as a board movement
+# either); it is a library-side change and it is not a like-for-like factor on
+# this entry's h1 rows against the previous run's. The library's fourth database
+# backend (ODBC, PR #36) lands in the same range with its CI and packaging; it is
+# off in the flag set below. Four CI legs on `134f34d` -- Linux, macOS, MSVC and
+# MinGW-w64 -- are green.
+#
+# What changed, in one sentence: the handlers no longer build an `nlohmann::json` DOM
+# per request. They build a `uvcpp_json_builder` tree and hand it to
+# `uvcpp_json_write`, which is yyjson's own serializer (`yyjson_mut_val_write_buf`)
+# -- and yyjson is a production-grade library the framework itself bundles, which
+# is the standard rule's own exception
+# ("If the framework itself bundles or officially recommends a specific library, that
+# library is acceptable", `implementation-rules/frameworks/standard.md`). It is also
+# the backend decision the shipped packages already make: all six release legs pass
+# `-DUVCPP_ENABLE_YYJSON=ON` in their package builds, so this is the released
+# library's own configuration rather than an entry-only one.
+#
+# The criterion is byte-identity, and it is met. Same library, two `main.cc`, 17 URLs
+# -- `/json/0` through `/json/50` with and without `m`, `count` past the end of the
+# dataset, one negative `count`, one `m` of a million, and five `/async-db` ranges
+# against the seeded Postgres: every body `cmp`-equal, every status line identical,
+# every `Content-Type` identical. The key order the DOM path got for free from
+# `std::map` is spelled out in the builder -- insertion order is what a builder keeps
+# -- and the nested `rating` object is rebuilt key by key, because the data file lists
+# it `score, count` while the response has always answered `count, score`. Getting
+# that wrong would have been a silently different body, not a crash.
+#
+# Measured on the local rig, the same library with only `main.cc` swapped, arms
+# alternating over four rounds, the client at the shape these profiles actually use
+# (`pipeline = 1`, 1024 connections -- `scripts/lib/profiles.sh` has `json-comp`,
+# `json-tls` and `async-db` at pipeline 1, and depth past the library's documented
+# per-connection cap answers `503`). `/json/50?m=6`: 228.60 -> 125.31 us of server CPU
+# per request and 60,350 -> 89,605 req/s, the arms' four-round ranges not overlapping
+# (228.60-303.57 against 125.31-156.23 us). `/async-db` at `min=1&max=500&limit=20`:
+# 258.62 -> 158.95 us and 30,794 -> 41,120 req/s (258.62-319.94 against 158.95-194.29).
+# Both arms answered zero non-2xx. Both arms also run the same library, so `638512b`
+# and the ODBC batch are held constant and are in neither column. The dataset is
+# additionally parsed once at startup by `uvcpp_json_parse` instead of being held as
+# an `nlohmann::json`; that parse happens before the first request is accepted, so it
+# is in neither figure.
 #
 # Why brotli is off, given that `json-compressed` is the one profile in this suite
 # whose request asks for it (`Accept-Encoding: gzip, br`, byte for byte in
@@ -450,7 +511,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # and this entry is `mode: standard` -- so the framework's own middleware, answering
 # gzip, is what the guide asks for.
 ARG LIBUVCPP_REPO=https://github.com/Antruly/libuvcpp.git
-ARG LIBUVCPP_REF=0f34937fc68e34fc0309dcbc6c539ef5393b36d1
+ARG LIBUVCPP_REF=134f34db3b7eba08290504480fa89062fde5a3b5
 
 ARG OPENSSL_VERSION=3.5.0
 
@@ -516,11 +577,30 @@ RUN git init . \
  && git checkout FETCH_HEAD
 
 # `BUILD_SHARED_LIBS=OFF` makes every fetched dependency (libuv, llhttp, zlib,
-# nghttp2, ngtcp2, nghttp3) a static library, and `OPENSSL_USE_STATIC_LIBS=ON`
-# does the same for OpenSSL, so libpq is the only shared object the result
-# needs beyond libc and libstdc++. `CMAKE_POSITION_INDEPENDENT_CODE=ON` is
+# yyjson, nghttp2, ngtcp2, nghttp3) a static library, and
+# `OPENSSL_USE_STATIC_LIBS=ON` does the same for OpenSSL, so libpq is the only
+# shared object the result needs beyond libc and libstdc++.
+# `CMAKE_POSITION_INDEPENDENT_CODE=ON` is
 # required, not defensive: BUILD_SHARED_LIBS=OFF also flips CMake's PIC default
 # to OFF, and a non-PIC libuv/llhttp cannot be linked into libuvcpp.so.
+#
+# `UVCPP_ENABLE_YYJSON=ON` is the JSON backend the `/json` and `/async-db`
+# handlers answer through, and it is the flag the six release legs already pass
+# in their package builds (`release.yml`), so what this entry builds is the
+# released configuration and not an entry-only one. It fetches yyjson 0.13.0
+# over FetchContent exactly like the other five dependencies and compiles its
+# single `.c` into this same `libuvcpp.so` -- nothing extra is installed and
+# nothing else in the image changes. The paragraph at the pin note above is the
+# argument; the short version is that the profile's standard rule admits a
+# library the framework itself bundles, and this one it bundles.
+#
+# `UVCPP_ENABLE_DB_ODBC=OFF` is stated rather than left to the default, and the
+# default is why: the pin below carries the library's fourth database backend
+# (`1607dff`), whose option defaults ON and needs `sql.h` plus a driver manager.
+# This image installs neither, so CMake would force the backend off itself and
+# say so in a configure-time warning -- the same end state, reached by a warning
+# instead of a flag. The entry needs Postgres and nothing else, which is what the
+# two `OFF`s next to it already say.
 #
 # websocket, static files, h2 and h3 all come from these same flags -- there is
 # no second build for the TLS legs.
@@ -539,6 +619,7 @@ RUN cmake -S . -B build -G Ninja \
         -DUVCPP_BUILD_WEB=ON \
         -DUVCPP_BUILD_WEBAPP=ON \
         -DUVCPP_ENABLE_ZLIB=ON \
+        -DUVCPP_ENABLE_YYJSON=ON \
         -DUVCPP_ENABLE_BROTLI=OFF \
         -DUVCPP_ENABLE_OPENSSL=ON \
         -DUVCPP_ENABLE_NGHTTP2=ON \
@@ -548,6 +629,7 @@ RUN cmake -S . -B build -G Ninja \
         -DUVCPP_ENABLE_DB_PGSQL=ON \
         -DUVCPP_ENABLE_DB_MYSQL=OFF \
         -DUVCPP_ENABLE_DB_SQLITE=OFF \
+        -DUVCPP_ENABLE_DB_ODBC=OFF \
         -DUVCPP_ENABLE_CAPI=OFF \
         -DUVCPP_ENABLE_WSDL=OFF \
         -DOPENSSL_USE_STATIC_LIBS=ON \

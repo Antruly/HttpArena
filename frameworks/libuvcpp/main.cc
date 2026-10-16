@@ -58,6 +58,7 @@
 #include <webapp/uvcpp_web_response.h>
 #include <webapp/uvcpp_web_static.h>
 #include <webapp/uvcpp_web_ws.h>
+#include <yyjson/uvcpp_json_doc.h>
 
 #include <unistd.h>
 
@@ -212,8 +213,9 @@ uvcpp_web_static_options kStaticOpts = [] {
 }();
 
 /// The 50-item dataset, read once at startup. Read-only afterwards, so every
-/// worker loop can share it without a lock.
-uvcpp_json g_dataset;
+/// worker loop can share it without a lock: `uvcpp_json_value` reads touch
+/// nothing in the document, and nothing here ever mutates it.
+uvcpp_json_doc g_dataset;
 
 /// The Postgres pool behind `/async-db`. One pool for the process, not one per
 /// worker loop: the pool is the thing that owns the connections, and
@@ -388,19 +390,25 @@ void load_dataset() {
   const std::string text((std::istreambuf_iterator<char>(in)),
                          std::istreambuf_iterator<char>());
   // Through the framework's own documented parser rather than nlohmann's
-  // directly: same backend, but the entry then touches no JSON API the library
-  // does not publish. `uvcpp_json_parse` reports a `json_status` instead of
-  // throwing, and it applies the depth and size limits `nlohmann::json::parse`
-  // leaves to the caller. The 12 KB dataset is three orders of magnitude under
-  // its 8 MiB default.
-  uvcpp_json parsed;
-  const json_status st = uvcpp_json_parse(text, parsed);
-  if (st != json_status::OK) {
+  // directly: the entry then touches no JSON API the library does not publish.
+  // `uvcpp_json_parse` reports a `json_doc_status` instead of throwing, and it
+  // applies the depth and size limits (64 levels, 8 MiB) that
+  // `nlohmann::json::parse` leaves to the caller. The 12 KB dataset is three
+  // orders of magnitude under both.
+  //
+  // The parser here is the framework's yyjson backend, not its nlohmann one
+  // (`webapp/uvcpp_web_json.h`), because `/json` and `/async-db` build their
+  // responses with the same backend's construction side -- see `build_json`.
+  // A second parse of the same bytes into another DOM would only be a second
+  // copy of the dataset, and the two would have to be kept in step.
+  uvcpp_json_doc parsed;
+  const json_doc_status st = uvcpp_json_parse(text, parsed);
+  if (st != json_doc_status::OK) {
     std::fprintf(stderr, "libuvcpp: cannot parse `%s`: %s\n", path.c_str(),
-                 json_status_name(st));
+                 json_doc_status_name(st));
     return;
   }
-  if (!parsed.is_array()) {
+  if (!parsed.root().is_array()) {
     std::fprintf(stderr, "libuvcpp: `%s` is not a JSON array\n", path.c_str());
     return;
   }
@@ -473,47 +481,91 @@ long long baseline_sum(const uvcpp_web_request& req) {
   return sum;
 }
 
+/// One key of a parsed dataset item, copied whole into the builder: value,
+/// type and nesting included. A key the dataset does not have stays absent --
+/// `add_copy` on an invalid view would hang a `null` there, and the nlohmann
+/// path this replaced never invented a key either.
+void copy_item_key(uvcpp_json_builder& b, uvcpp_json_node obj, const char* key,
+                   const uvcpp_json_value& item) {
+  const uvcpp_json_value v = item.get(key);
+  if (v.valid()) b.add_copy(obj, key, v);
+}
+
 /// `{"count": N, "items": [...]}` for the first `count` dataset items, each
-/// carrying `total = price * quantity * m`. `count` leads because the object is
-/// nlohmann's default -- a `std::map` -- so keys come out sorted.
+/// carrying `total = price * quantity * m`. `count` leads because that is the
+/// order the response has always used: nlohmann's object is a `std::map` and
+/// its keys come out sorted, so `count` before `items`.
 ///
-/// Serialized per request, out of the live dataset, by the framework's standard
-/// JSON serialization: an `nlohmann::json` DOM built from the live items and
-/// handed to `resp.json()`, which is the framework's own `uvcpp_json_dump()` --
-/// `nlohmann::json::dump()` (`src/webapp/uvcpp_web_response.cpp:470`). Nothing
-/// is rendered ahead of time and no response is cached; every request walks the
+/// Built per request, out of the live dataset, by the framework's yyjson
+/// backend: a `uvcpp_json_builder` tree written out by `uvcpp_json_write`,
+/// which is yyjson's own serializer (`src/yyjson/uvcpp_json_doc.h`). The bytes
+/// come from a production-grade JSON library the framework bundles -- what the
+/// JSON profiles ask for when they ask for "the framework standard JSON
+/// serialization" and for the ecosystem's library over a hand-rolled
+/// alternative (`implementation-rules/frameworks/standard.md`). Nothing is
+/// rendered ahead of time and no response is cached; every request walks the
 /// live items and writes their bytes.
 ///
-/// The serializer is not the entry's to pick. These profiles exist to measure
-/// serialization, and Standard mode asks for "the framework standard JSON
-/// serialization" (test-profiles/h1/json-compressed/implementation.md) and for
-/// the ecosystem's production-grade library over a hand-rolled alternative
-/// (implementation-rules/frameworks/standard.md:55). `uvcpp_json_writer`, the
-/// streaming writer `<uvcpp/uvcpp_json_writer.h>` offers, is an alternative
-/// serializer -- implementation-rules/frameworks/tuned.md lists "Alternative
-/// JSON serializers" under Tuned -- so this entry does not route these
-/// responses through it.
-nlohmann::json build_json(int count, long long m) {
-  const int available = static_cast<int>(g_dataset.size());
+/// `uvcpp_json_writer`, the streaming writer `<uvcpp/uvcpp_json_writer.h>`
+/// offers, is an alternative serializer -- `implementation-rules/frameworks/
+/// tuned.md` lists "Alternative JSON serializers" under Tuned -- and this entry
+/// still does not route these responses through it. What the 1.7.2 pin added is
+/// a construction side to the framework's own backend, so the standard path and
+/// the fast path stopped being different paths.
+///
+/// **The key order below is load-bearing.** A `uvcpp_json_builder` object keeps
+/// insertion order while nlohmann's sorts, so the order has to be spelled out,
+/// and it is spelled out as that sorted order: `active`, `category`, `id`,
+/// `name`, `price`, `quantity`, `rating`, `tags`, `total`. Copying a whole item
+/// with `add_copy` would carry the data file's order instead. For the same
+/// reason the nested `rating` object is rebuilt key by key -- the dataset lists
+/// it `score, count` -- while `tags`, an array, can be copied whole, because
+/// arrays keep their order in both serializers.
+bool build_json(std::string& out, int count, long long m) {
+  const uvcpp_json_value items = g_dataset.root();
+  const int available = static_cast<int>(items.size());
   int n = count;
   if (n < 0) n = 0;
   if (n > available) n = available;
 
-  nlohmann::json items = nlohmann::json::array();
+  uvcpp_json_builder b;
+  uvcpp_json_node root = b.make_object();
+  b.set_root(root);
+  b.add_int(root, "count", n);
+  uvcpp_json_node arr = b.add_array(root, "items");
   for (int i = 0; i < n; ++i) {
-    nlohmann::json item = g_dataset[static_cast<std::size_t>(i)];
-    long long price = 0;
-    long long quantity = 0;
-    uvcpp_json_get_int(item, "price", price);
-    uvcpp_json_get_int(item, "quantity", quantity);
-    item["total"] = price * quantity * m;
-    items.push_back(std::move(item));
+    const uvcpp_json_value item = items.at(static_cast<size_t>(i));
+    // Read with the same reading the nlohmann path used: a missing or
+    // non-numeric value counts as zero. Only `total` is arithmetic; every other
+    // value goes through `copy_item_key` untouched.
+    const long long price = item.get("price").as_int();
+    const long long quantity = item.get("quantity").as_int();
+
+    uvcpp_json_node o = b.push_object(arr);
+    copy_item_key(b, o, "active", item);
+    copy_item_key(b, o, "category", item);
+    copy_item_key(b, o, "id", item);
+    copy_item_key(b, o, "name", item);
+    copy_item_key(b, o, "price", item);
+    copy_item_key(b, o, "quantity", item);
+    const uvcpp_json_value rating = item.get("rating");
+    if (rating.valid()) {
+      uvcpp_json_node r = b.add_object(o, "rating");
+      copy_item_key(b, r, "count", rating);
+      copy_item_key(b, r, "score", rating);
+    }
+    copy_item_key(b, o, "tags", item);
+    b.add_int(o, "total", price * quantity * m);
   }
 
-  nlohmann::json payload;
-  payload["items"] = std::move(items);
-  payload["count"] = n;
-  return payload;
+  const json_write_status st = uvcpp_json_write(root, out);
+  if (st != json_write_status::OK) {
+    // Either `NO_MEMORY` (a resize of `out` failed) or `MISUSE` (the tree is
+    // not there at all, i.e. the pools failed); `last_error()` says which.
+    std::fprintf(stderr, "libuvcpp: `/json` could not be written: %s\n",
+                 b.last_error());
+  }
+  return st == json_write_status::OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -543,8 +595,19 @@ void handle_json(uvcpp_web_request& req, uvcpp_web_response& resp,
   const std::string* count = req.param("count");
   const std::string* multiplier = req.query("m");
   const long long m = multiplier != nullptr ? to_ll(*multiplier) : 1;
-  resp.json(build_json(count != nullptr ? static_cast<int>(to_ll(*count)) : 0,
-                       m));
+  std::string body;
+  if (build_json(body,
+                 count != nullptr ? static_cast<int>(to_ll(*count)) : 0, m)) {
+    // `json_str(std::string&&)` takes the buffer over rather than copying it,
+    // exactly as `resp.json()` does with the string `dump()` returns.
+    resp.json_str(std::move(body));
+  } else {
+    // Not answerable, so say so rather than answer a body that is missing
+    // items. The documented empty result set is `/async-db`'s fallback, not
+    // this profile's; a short answer that claims a `count` it does not have
+    // would be the one thing worse than a 500.
+    resp.status(500).json_str("{\"error\":\"json build failed\"}");
+  }
   resp.end();
 }
 
@@ -576,11 +639,38 @@ nlohmann::json parse_tags(const std::string& text) {
   return nlohmann::json::array();
 }
 
-/// `{"count": N, "items": [...]}` for the rows Postgres returned, as a DOM the
-/// framework's `resp.json()` serializes per request. `count` leads because the
-/// serializer is nlohmann's and an object there is a `std::map`, so keys come
-/// out sorted; that is also the order this entry's reference path and
-/// `/api/items` have always used.
+/// The same column, into a builder instead of a DOM. Copying the parsed array
+/// whole is safe here -- an array keeps its order in both serializers, and the
+/// elements keep their types (strings, on this column) rather than being
+/// re-typed on the way through.
+///
+/// The `[]` fallback is the documented one from `parse_tags` above: the key is
+/// always there, and a literal that will not parse becomes an empty array
+/// rather than failing the request.
+void copy_tags(uvcpp_json_builder& b, uvcpp_json_node obj,
+               const std::string& text) {
+  uvcpp_json_doc parsed;
+  if (uvcpp_json_parse(text, parsed) == json_doc_status::OK) {
+    // `root()` after the parse, never before: a value view borrows the
+    // document, and a successful `parse()` replaces the document underneath it.
+    const uvcpp_json_value v = parsed.root();
+    if (v.is_array()) {
+      b.add_copy(obj, "tags", v);
+      return;
+    }
+  }
+  b.add_array(obj, "tags");
+}
+
+/// `{"count": N, "items": [...]}` for the rows Postgres returned, built the same
+/// way `/json` builds its body: a `uvcpp_json_builder` tree written out by
+/// `uvcpp_json_write`, the framework's yyjson backend.
+///
+/// `count` leads and the item keys follow the order below, which is the order
+/// this response has always used -- nlohmann's `std::map` sort, and the same
+/// order `/api/items` uses. So `rating` is rebuilt key by key: the response
+/// says `count` before `score`, while the old code inserted `score` first and
+/// let nlohmann sort it.
 ///
 /// Column names are the profile's, not an invention: `id`, `name`, `category`,
 /// `price`, `quantity`, `active`, `tags`, then `rating_score`/`rating_count`
@@ -588,45 +678,55 @@ nlohmann::json parse_tags(const std::string& text) {
 /// the profile reads `price` and `rating.score` as INTEGER and says so.
 /// `count` is the number of rows actually returned, never the requested limit.
 ///
-/// `tags` is JSONB and the driver hands JSONB over as text, so the column
-/// arrives as the array literal `["fast", "new"]`. `parse_tags` above is what
-/// turns that literal into the array the response carries -- an nlohmann
-/// `parse()` per row, which is the documented reading of that column.
-nlohmann::json build_async_db_json(const uvcpp_db_table& table) {
+/// Unlike `/json` there is no `total`: the profile's `/async-db` shape does not
+/// have one, and this handler has never added it.
+bool build_async_db_json(std::string& out, const uvcpp_db_table& table) {
   const std::vector<uvcpp_db_row>& rows = table.rows();
-  nlohmann::json items = nlohmann::json::array();
+  uvcpp_json_builder b;
+  uvcpp_json_node root = b.make_object();
+  b.set_root(root);
+  b.add_int(root, "count", static_cast<long long>(rows.size()));
+  uvcpp_json_node arr = b.add_array(root, "items");
   for (size_t i = 0; i < rows.size(); ++i) {
     const uvcpp_db_row& row = rows[i];
-    nlohmann::json item;
-    item["id"] = row["id"].to_int64();
-    item["name"] = row["name"].to_text();
-    item["category"] = row["category"].to_text();
-    item["price"] = row["price"].to_int64();
-    item["quantity"] = row["quantity"].to_int64();
-    item["active"] = row["active"].to_bool();
-    item["tags"] = parse_tags(row["tags"].to_text());
-    nlohmann::json rating;
-    rating["score"] = row["rating_score"].to_int64();
-    rating["count"] = row["rating_count"].to_int64();
-    item["rating"] = std::move(rating);
-    items.push_back(std::move(item));
+    uvcpp_json_node o = b.push_object(arr);
+    b.add_bool(o, "active", row["active"].to_bool());
+    b.add_string(o, "category", row["category"].to_text());
+    b.add_int(o, "id", row["id"].to_int64());
+    b.add_string(o, "name", row["name"].to_text());
+    b.add_int(o, "price", row["price"].to_int64());
+    b.add_int(o, "quantity", row["quantity"].to_int64());
+    uvcpp_json_node r = b.add_object(o, "rating");
+    b.add_int(r, "count", row["rating_count"].to_int64());
+    b.add_int(r, "score", row["rating_score"].to_int64());
+    copy_tags(b, o, row["tags"].to_text());
   }
 
-  nlohmann::json payload;
-  payload["count"] = static_cast<long long>(rows.size());
-  payload["items"] = std::move(items);
-  return payload;
+  const json_write_status st = uvcpp_json_write(root, out);
+  if (st != json_write_status::OK) {
+    std::fprintf(stderr, "libuvcpp: `/async-db` could not be written: %s\n",
+                 b.last_error());
+  }
+  return st == json_write_status::OK;
 }
 
 /// The documented fallback shape, for when the pool is not up or the statement
 /// did not run. Built here rather than spelled out as a literal, so the empty
 /// answer and the populated one are the same object graph and cannot drift
-/// apart; `resp.json()` serializes it exactly like any other.
-nlohmann::json empty_table_json() {
-  nlohmann::json payload;
-  payload["count"] = 0;
-  payload["items"] = nlohmann::json::array();
-  return payload;
+/// apart; the same serializer writes it.
+///
+/// The write status is deliberately not reported: these 26 bytes can only fail
+/// on a `std::bad_alloc` from `out`'s first resize, and a fallback body for
+/// that would have to allocate as well. `out` is then empty, which every
+/// profile reads as a failed request -- the honest answer from a process that
+/// has run out of memory.
+void write_empty_table(std::string& out) {
+  uvcpp_json_builder b;
+  uvcpp_json_node root = b.make_object();
+  b.set_root(root);
+  b.add_int(root, "count", 0);
+  b.add_array(root, "items");
+  (void)uvcpp_json_write(root, out);
 }
 
 /// The retry half of init_database(): keep trying to open the pool, and give up
@@ -767,7 +867,9 @@ void handle_async_db(uvcpp_web_app* app, uvcpp_web_request& req,
   if (limit > 50) limit = 50;
 
   if (!g_db_ready) {
-    resp.json(empty_table_json());
+    std::string body;
+    write_empty_table(body);
+    resp.json_str(std::move(body));
     resp.end();
     return;
   }
@@ -784,11 +886,13 @@ void handle_async_db(uvcpp_web_app* app, uvcpp_web_request& req,
   const int rc = g_db.query(
       app->loop(), kAsyncDbSql, params,
       [rp, next](uvcpp_db_status status, const uvcpp_db_table& table) {
-        if (uvcpp_db_ok(status)) {
-          rp->json(build_async_db_json(table));
-        } else {
-          rp->json(empty_table_json());
-        }
+        std::string body;
+        if (uvcpp_db_ok(status)) build_async_db_json(body, table);
+        // A statement that did not run and a body that could not be written
+        // (the writer leaves `out` empty on failure) are the same answer here:
+        // the documented empty result set, not a body that is short by rows.
+        if (body.empty()) write_empty_table(body);
+        rp->json_str(std::move(body));
         rp->end();
         next();
       });
@@ -796,7 +900,9 @@ void handle_async_db(uvcpp_web_app* app, uvcpp_web_request& req,
     // Not dispatched: per the pool's contract the callback will not run, so
     // this is the only reply this request gets. `next` was never copied, so
     // the chain is not left suspended.
-    resp.json(empty_table_json());
+    std::string body;
+    write_empty_table(body);
+    resp.json_str(std::move(body));
     resp.end();
   }
 }
@@ -1171,7 +1277,10 @@ int main() {
   uvcpp_logger::instance().set_level(log_level::OFF);
 
   load_dataset();
-  if (g_dataset.empty()) {
+  // `valid()` is "the parse succeeded" and `size()` on the root is the item
+  // count, so this covers both a dataset that would not load and one that
+  // loaded as `[]`.
+  if (!g_dataset.valid() || g_dataset.root().size() == 0) {
     std::fprintf(stderr, "libuvcpp: dataset is empty -- /json will answer "
                          "with an empty item list\n");
   }

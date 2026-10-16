@@ -8,8 +8,8 @@ libuvcpp on the libuv event loop, one loop per available core.
 - **Library:** libuvcpp 1.7.x ([repo](https://github.com/Antruly/libuvcpp)),
   built from source in the image
 - **Build:** `cmake -DCMAKE_BUILD_TYPE=Release` on `ubuntu:24.04`, with libuv,
-  llhttp, zlib, nghttp2, ngtcp2, nghttp3 and OpenSSL 3.5 all built statically
-  into `libuvcpp.so`; the entry is `g++ -std=c++11 -O2 -DNDEBUG`
+  llhttp, zlib, yyjson 0.13.0, nghttp2, ngtcp2, nghttp3 and OpenSSL 3.5 all
+  built statically into `libuvcpp.so`; the entry is `g++ -std=c++11 -O2 -DNDEBUG`
 
 The library is built from source rather than installed from a published
 `libuvcpp-<version>-linux-x64` release package. That package was the only
@@ -18,7 +18,7 @@ release workflow's legs passed `-DUVCPP_ENABLE_DB_MYSQL=OFF
 -DUVCPP_ENABLE_DB_PGSQL=OFF` — the workflow asserts it with an `ldd` check that
 fails if `libpq.so` appears — while `/async-db` needs the Postgres backend. The
 pin has since moved onto development revisions: the `v1.7.0` tag is the nearest
-release, the pin is twelve commits past it, and a release package exists only for
+release, the pin is 37 commits past it, and a release package exists only for
 a tag, so building the pinned SHA from source is the only way to build exactly
 what the pin names. The `1.7.0` packages do carry both remote backends, behind
 the runtime-load seam that is why the same `ldd` list still passes, so the
@@ -132,12 +132,15 @@ the profile forbids the framework from doing the JWT verification itself.
   documented static handler. Nothing in the entry reads or caches static bytes
   itself — the handler revalidates each request against the file's size and
   `mtime` (seconds and nanoseconds), so a replaced file is served immediately.
-- **JSON is serialized per request by the framework's standard serializer.**
-  The handler builds an `nlohmann::json` DOM out of the live dataset — the
-  framework's own `uvcpp_json` is nlohmann's `json`, and the response goes out
-  through `resp.json()`, which is the framework's `uvcpp_json_dump()` — and
-  `total` is computed inside the loop, per request. Nothing is pre-serialized,
-  cached, or spliced out of a previously rendered buffer.
+- **JSON is serialized per request by the framework's JSON backend.** The
+  handler walks the live dataset, builds a `uvcpp_json_builder` tree — a public
+  and documented API in `doc/json-guide.md` — and writes it out through
+  `uvcpp_json_write`, which is yyjson's own serializer. The
+  backend is the library's yyjson one; the Dockerfile turns it on with
+  `-DUVCPP_ENABLE_YYJSON=ON`, which is the flag all six release legs pass in
+  their package builds, so this is the shipped library's configuration and not
+  an entry-only one. `total` is computed inside the loop, per request. Nothing
+  is pre-serialized, cached, or spliced out of a previously rendered buffer.
 
   This is deliberate, and it is the one place this entry gives up speed for the
   rules. The profile's JSON tests exist to measure serialization, Standard mode
@@ -145,23 +148,46 @@ the profile forbids the framework from doing the JWT verification itself.
   (`test-profiles/h1/json-compressed/implementation.md`) and for the
   ecosystem's production-grade library over a hand-rolled alternative
   (`implementation-rules/frameworks/standard.md`: "Experimental or hand-rolled
-  alternatives solely for benchmark performance are not permitted"), and
-  `implementation-rules/frameworks/tuned.md` lists "Alternative JSON
-  serializers" among the things *Tuned* allows. `uvcpp_json_writer` — the
-  library's streaming writer, a public and documented API that
-  `doc/json-guide.md` describes — is such an alternative serializer, so this
-  entry does not answer these profiles with it. The same applies to `/async-db`,
-  which used to walk the result rows straight into the writer. Reading is the
-  same rule the other way: `uvcpp_json_parse` and the `uvcpp_json_get_*`
-  accessors rather than nlohmann's `parse` and `value()` directly, so every JSON
-  call the entry makes is one the library publishes — and none of them can throw
-  out of a libuv callback, which is what those accessors exist for.
-- **The cost of that choice, measured.** At the 1.7.2-dev pin this repository
-  was built on, `/json/50?m=6` through the writer cost 63.2 us of server CPU per
-  request against the DOM path's 176.0 us on the same 6 pinned cores, and the
-  writer also skipped the per-item DOM copy the DOM path makes. Both figures are
-  the ones this entry reported in earlier revisions; they are recorded here
-  because the entry no longer collects them.
+  alternatives solely for benchmark performance are not permitted"), and the
+  same file's exception is what settles which library: "If the framework itself
+  bundles or officially recommends a specific library, that library is
+  acceptable" — yyjson is bundled by libuvcpp itself and compiled into the same
+  `libuvcpp.so` the entry links. `implementation-rules/frameworks/tuned.md`
+  lists "Alternative JSON serializers" among the things *Tuned* allows, and
+  `uvcpp_json_writer` — the library's streaming writer, a public and documented
+  API that `doc/json-guide.md` describes — is such an alternative serializer, so
+  this entry does not answer these profiles with it. The same applies to
+  `/async-db`, which used to walk the result rows straight into the writer.
+  Reading is the same rule the other way: `uvcpp_json_parse` and the
+  `uvcpp_json_get_*` accessors rather than nlohmann's `parse` and `value()`
+  directly, so every JSON call the entry makes is one the library publishes —
+  and none of them can throw out of a libuv callback, which is what those
+  accessors exist for.
+- **The response bytes did not change.** The handlers used to build an
+  `nlohmann::json` DOM and send it through `resp.json()`; both now build a
+  builder tree and write it with yyjson. Over 17 URLs — `/json/0` to `/json/50`
+  with and without `m`, a `count` past the end of the dataset, a negative
+  `count`, an `m` of a million, and five `/async-db` ranges against the seeded
+  Postgres — every body is byte-identical between the two, with the same status
+  lines and the same `Content-Type`. The order a `std::map` sorted for the DOM
+  path is now spelled out in the builder, because insertion order is what a
+  builder keeps, and the nested `rating` object is rebuilt key by key for the
+  same reason (the data file lists it `score, count`; the response has always
+  answered `count, score`).
+- **The cost of choosing the backend over the writer, measured.** At the
+  1.7.2-dev pin this repository was built on, `/json/50?m=6` through the writer
+  cost 63.2 us of server CPU per request against the DOM path's 176.0 us on the
+  same 6 pinned cores, and the writer also skipped the per-item DOM copy the DOM
+  path makes. Those two figures are the ones this entry reported in earlier
+  revisions; they are recorded here as the size of the gap the rules ask it to
+  accept, not as a pair it still collects. What it does collect is the backend
+  swap itself, same library and only `main.cc` different, arms alternating over
+  four rounds at the shape these profiles use (`pipeline = 1`, 1024
+  connections): `/json/50?m=6` went from 228.60 to 125.31 us of server CPU per
+  request and from 60,350 to 89,605 req/s (the four-round ranges do not overlap:
+  228.60-303.57 against 125.31-156.23 us), and `/async-db` at
+  `min=1&max=500&limit=20` from 258.62 to 158.95 us and from 30,794 to 41,120
+  req/s. Both arms answered zero non-2xx.
 - **Compression is the framework's built-in response compression** (gzip), which
   answers `Accept-Encoding` per request and adds no `Content-Encoding` when the
   client sends none, at the library's own default level. The library also
@@ -233,15 +259,17 @@ the profile forbids the framework from doing the JWT verification itself.
 - **`tags` is parsed, not spliced.** Postgres returns JSONB as text (OID 3802
   is not one of the driver's mapped types, and an unmapped OID degrades to the
   string libpq returned), and that string *is* the JSON array — so it has to
-  reach the response as an array rather than as a quoted string. `parse_tags`
-  runs `uvcpp_json_parse` over it and puts the array in the DOM, which is then
-  serialized with everything else by `resp.json()`. It used to be walked and
-  copied through instead, which was faster and is what the writer path did; see
-  the `/json` note above for why that is not this entry's call to make.
+  reach the response as an array rather than as a quoted string. `copy_tags`
+  runs `uvcpp_json_parse` over it and copies the array into the builder — an
+  array keeps its order in both serializers, so it can be copied whole where an
+  object could not — and it is written out with everything else. It used to be
+  walked and copied through instead, which was faster and is what the writer
+  path did; see the `/json` note above for why that is not this entry's call to
+  make.
 - **One serializer, one path.** Every response body this profile serves —
-  including the ones carrying `tags` — is built as an `nlohmann::json` DOM and
-  dumped by the framework. There is no second, hand-written path to prove
-  against the first.
+  including the ones carrying `tags` — is built with the framework's JSON
+  backend and written by the framework's serializer. There is no second,
+  hand-written path to prove against the first.
 - **Failure is not fatal and not silent-in-the-wrong-way.** With no
   `DATABASE_URL`, or a pool that will not open, `/async-db` answers the
   documented empty result set — `{"count":0,"items":[]}`, built by the same
