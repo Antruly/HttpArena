@@ -736,6 +736,7 @@
     "type": "emerging",
     "engine": "ioxide",
     "mode": "standard",
+    "website": "https://genhttp.org/documentation/server/engines/ioxide/",
     "completeness": {
       "routing": true,
       "middleware": true,
@@ -750,6 +751,7 @@
     "type": "emerging",
     "engine": "kestrel",
     "mode": "standard",
+    "website": "https://genhttp.org/documentation/server/engines/kestrel/",
     "completeness": {
       "routing": true,
       "middleware": true,
@@ -764,6 +766,7 @@
     "type": "emerging",
     "engine": "genhttp",
     "mode": "standard",
+    "website": "https://genhttp.org/",
     "completeness": {
       "routing": true,
       "middleware": true,
@@ -1167,7 +1170,7 @@
   },
   "libuvcpp": {
     "dir": "libuvcpp",
-    "description": "libuvcpp on the libuv event loop, one loop per available core. Routing, path and query params, static files and WebSocket through uvcpp_web_app, JSON serialized per request through the framework's uvcpp_json DOM (nlohmann/json, no pre-rendered bytes), gzip through the built-in response compression, async Postgres through uvcpp_db_pool, and gRPC unary calls through the uvcpp_grpc module. One process serves HTTP/1.1 and prior-knowledge h2c on 8080, h2c on 8082, HTTP/2 over TLS on 8443, and HTTP/3 on 8443/udp, all from the same build; the gateway-64 and production-stack profiles put a stock nginx edge in front of it and gateway-h3 a stock Caddy one.",
+    "description": "libuvcpp on the libuv event loop, one loop per available core. Routing, path and query params, static files and WebSocket through uvcpp_web_app, JSON serialized per request through the framework's bundled yyjson backend (uvcpp_json_builder, written by yyjson's own serializer, no pre-rendered bytes), gzip through the built-in response compression, async Postgres through uvcpp_db_pool, and gRPC unary calls through the uvcpp_grpc module. One process serves HTTP/1.1 and prior-knowledge h2c on 8080, h2c on 8082, HTTP/2 over TLS on 8443, and HTTP/3 on 8443/udp, all from the same build; the gateway-64 and production-stack profiles put a stock nginx edge in front of it and gateway-h3 a stock Caddy one.",
     "repo": "https://github.com/Antruly/libuvcpp",
     "type": "emerging",
     "engine": "libuv",
